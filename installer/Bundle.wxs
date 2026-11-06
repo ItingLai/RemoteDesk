@@ -1,0 +1,59 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:netfx="http://wixtoolset.org/schemas/v4/wxs/netfx"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+  <Bundle Name="RemoteDesk"
+          Manufacturer="RemoteDesk"
+          Version="1.0.0.0"
+          UpgradeCode="9C4B7D24-8BD5-4E81-A0B8-5B54C4F4A1E8"
+          IconSourceFile="src/RemoteDesk/app.ico">
+
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication
+          Theme="hyperlinkLicense"
+          LicenseUrl="https://dotnet.microsoft.com/download/dotnet/9.0"
+          LogoFile="src/RemoteDesk/Resources/logo.png" />
+    </BootstrapperApplication>
+
+    <!-- 1. 嚴格檢查 .NET 9 Desktop Runtime (x64) 具備性：
+         - 限制 MajorVersion="9"，排除 .NET 8 與 .NET 10
+         - 限制 Platform="x64"，排除 x86 與 arm64
+         - 限制 RuntimeType="desktop"，確保包含 Windows Forms / WPF 桌面執行階段，而非僅有基礎 .NET Runtime
+    -->
+    <netfx:DotNetCoreSearch
+        Id="SearchDotNet9DesktopX64"
+        RuntimeType="desktop"
+        Platform="x64"
+        MajorVersion="9"
+        Variable="DotNet9DesktopExists" />
+
+    <Chain>
+      <!-- 2. 線上下載 Microsoft 官方 .NET 9 Desktop Runtime x64 安裝程式：
+           - 採 Framework-dependent，安裝包不預先包裝 60MB Runtime (Compressed="no")
+           - 當檢測到系統缺少 .NET 9 Desktop Runtime 時，自動由微軟官方 CDN 下載
+           - 嚴格校驗數位簽章與 SHA256 完整性
+           - 安裝參數採靜默安裝 /install /quiet /norestart
+      -->
+      <ExePackage
+          Id="Net9DesktopRuntime"
+          SourceFile="installer/cache/windowsdesktop-runtime-9.0.22-win-x64.exe"
+          DisplayName="Microsoft .NET 9 Desktop Runtime (x64)"
+          Description="Microsoft Windows Desktop Runtime 9.0 (x64)"
+          Compressed="no"
+          Permanent="yes"
+          Vital="yes"
+          InstallArguments="/install /quiet /norestart"
+          RepairArguments="/repair /quiet /norestart"
+          UninstallArguments="/uninstall /quiet /norestart"
+          DetectCondition="DotNet9DesktopExists"
+          DownloadUrl="https://builds.dotnet.microsoft.com/dotnet/WindowsDesktop/9.0.22/windowsdesktop-runtime-9.0.22-win-x64.exe" />
+
+      <!-- 3. RemoteDesk MSI 主程式安裝包 -->
+      <MsiPackage
+          Id="RemoteDeskMsi"
+          DisplayName="RemoteDesk"
+          SourceFile="dist/RemoteDesk.msi"
+          Compressed="yes"
+          Vital="yes" />
+    </Chain>
+  </Bundle>
+</Wix>

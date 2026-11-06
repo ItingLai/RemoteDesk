@@ -100,6 +100,47 @@ internal sealed class SecureChannel : IDisposable
         catch { return false; }
     }
 
+    /// <summary>同步發送訊息並立即 Flush（用於連線關閉前的關鍵 Disconnect 封包，防止非同步未完成即被釋放）。</summary>
+    public bool SendSync(ReadOnlyMemory<byte> plain, int timeoutMs = 500)
+    {
+        if (_disposed) return false;
+        var frame = new byte[4 + plain.Length + TagSize];
+        BinaryPrimitives.WriteInt32LittleEndian(frame, plain.Length + TagSize);
+        if (!_writeLock.Wait(timeoutMs)) return false;
+        try
+        {
+            if (_disposed) return false;
+            Span<byte> nonce = stackalloc byte[12];
+            BinaryPrimitives.WriteUInt64LittleEndian(nonce[4..], _sendCounter++);
+            _sendAes.Encrypt(nonce, plain.Span, frame.AsSpan(4, plain.Length), frame.AsSpan(4 + plain.Length, TagSize));
+            _stream.Write(frame);
+            _stream.Flush();
+            Interlocked.Add(ref BytesSent, frame.Length);
+            return true;
+        }
+        catch { return false; }
+        finally { _writeLock.Release(); }
+    }
+
+    /// <summary>即時檢查通道是否有效。</summary>
+    public bool IsConnected
+    {
+        get
+        {
+            if (_disposed) return false;
+            try
+            {
+                if (_stream is NetworkStream ns)
+                {
+                    var s = ns.Socket;
+                    if (s == null || !s.Connected) return false;
+                }
+                return true;
+            }
+            catch { return false; }
+        }
+    }
+
     /// <summary>接收一則訊息；只能由單一執行緒呼叫。</summary>
     public async Task<byte[]> ReceiveAsync(CancellationToken ct = default)
     {
@@ -185,9 +226,9 @@ internal sealed class SecureChannel : IDisposable
         s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
         try
         {
-            s.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 10);
+            s.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 15);
             s.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 3);
-            s.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3);
+            s.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 5);
         }
         catch { }
     }

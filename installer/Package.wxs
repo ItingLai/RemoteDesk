@@ -1,0 +1,137 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="RemoteDesk"
+           Manufacturer="RemoteDesk"
+           Version="1.0.0.0"
+           UpgradeCode="E72B91F1-0C53-4E22-90D1-4E48FDADF544"
+           Scope="perMachine"
+           Language="1028"
+           Codepage="65001">
+
+    <SummaryInformation Description="RemoteDesk 遠端桌面控制系統安裝程式"
+                        Manufacturer="RemoteDesk" />
+
+    <MajorUpgrade DowngradeErrorMessage="已經安裝了更新版本的 RemoteDesk。若要安裝此版本，請先手動解除安裝現有版本。"
+                  Schedule="afterInstallInitialize" />
+
+    <MediaTemplate CabinetTemplate="rd{0}.cab" EmbedCab="yes" />
+
+    <Icon Id="AppIcon" SourceFile="src/RemoteDesk/app.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/remotedesk" />
+    <Property Id="ARPNOREPAIR" Value="0" />
+    <Property Id="INSTALLDESKTOPSHORTCUT" Value="1" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="RemoteDesk" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="RemoteDesk" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder" />
+
+    <ComponentGroup Id="ProductFiles" Directory="INSTALLFOLDER">
+      <Component Id="MainExecutable" Bitness="always64" Guid="D2A6874E-57E0-449F-A7CD-132717C2DF11">
+        <File Id="RemoteDeskExe" Source="publish/RemoteDesk.exe" KeyPath="yes" />
+        <Shortcut Id="StartMenuShortcut"
+                  Directory="ApplicationProgramsFolder"
+                  Name="RemoteDesk"
+                  Description="RemoteDesk"
+                  Target="[!RemoteDeskExe]"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="AppIcon"
+                  Advertise="no">
+          <ShortcutProperty Key="System.AppUserModel.ID" Value="RemoteDesk" />
+        </Shortcut>
+        <RemoveFolder Id="CleanUpStartMenuFolder" Directory="ApplicationProgramsFolder" On="uninstall" />
+      </Component>
+
+      <Component Id="C_RemoteDeskDll" Bitness="always64" Guid="D2A6874E-57E0-449F-A7CD-132717C2DF12">
+        <File Source="publish/RemoteDesk.dll" KeyPath="yes" />
+      </Component>
+      <Component Id="C_RuntimeConfig" Bitness="always64" Guid="D2A6874E-57E0-449F-A7CD-132717C2DF13">
+        <File Source="publish/RemoteDesk.runtimeconfig.json" KeyPath="yes" />
+      </Component>
+      <Component Id="C_DepsJson" Bitness="always64" Guid="D2A6874E-57E0-449F-A7CD-132717C2DF14">
+        <File Source="publish/RemoteDesk.deps.json" KeyPath="yes" />
+      </Component>
+      <Component Id="C_SharpGenCOM" Bitness="always64" Guid="D2A6874E-57E0-449F-A7CD-132717C2DF15">
+        <File Source="publish/SharpGen.Runtime.COM.dll" KeyPath="yes" />
+      </Component>
+      <Component Id="C_SharpGen" Bitness="always64" Guid="D2A6874E-57E0-449F-A7CD-132717C2DF16">
+        <File Source="publish/SharpGen.Runtime.dll" KeyPath="yes" />
+      </Component>
+      <Component Id="C_ServiceController" Bitness="always64" Guid="D2A6874E-57E0-449F-A7CD-132717C2DF17">
+        <File Source="publish/System.ServiceProcess.ServiceController.dll" KeyPath="yes" />
+      </Component>
+      <Component Id="C_VorticeD3D11" Bitness="always64" Guid="D2A6874E-57E0-449F-A7CD-132717C2DF18">
+        <File Source="publish/Vortice.Direct3D11.dll" KeyPath="yes" />
+      </Component>
+      <Component Id="C_VorticeDirectX" Bitness="always64" Guid="D2A6874E-57E0-449F-A7CD-132717C2DF19">
+        <File Source="publish/Vortice.DirectX.dll" KeyPath="yes" />
+      </Component>
+      <Component Id="C_VorticeDXGI" Bitness="always64" Guid="D2A6874E-57E0-449F-A7CD-132717C2DF20">
+        <File Source="publish/Vortice.DXGI.dll" KeyPath="yes" />
+      </Component>
+      <Component Id="C_VorticeMath" Bitness="always64" Guid="D2A6874E-57E0-449F-A7CD-132717C2DF21">
+        <File Source="publish/Vortice.Mathematics.dll" KeyPath="yes" />
+      </Component>
+      <Component Id="C_AppIco" Bitness="always64" Guid="D2A6874E-57E0-449F-A7CD-132717C2DF24">
+        <File Id="AppIcoFile" Source="publish/app.ico" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Component Id="DesktopShortcut" Directory="DesktopFolder" Bitness="always64" Guid="D2A6874E-57E0-449F-A7CD-132717C2DF22">
+      <Shortcut Id="AppDesktopShortcut"
+                Name="RemoteDesk"
+                Description="RemoteDesk"
+                Target="[!RemoteDeskExe]"
+                WorkingDirectory="INSTALLFOLDER"
+                Icon="AppIcon"
+                Advertise="no">
+        <ShortcutProperty Key="System.AppUserModel.ID" Value="RemoteDesk" />
+      </Shortcut>
+      <RegistryValue Root="HKCU"
+                     Key="Software\RemoteDesk"
+                     Name="DesktopShortcutInstalled"
+                     Type="integer"
+                     Value="1"
+                     KeyPath="yes" />
+    </Component>
+
+    <Component Id="RegistryAppUserModelId" Directory="INSTALLFOLDER" Bitness="always64" Guid="D2A6874E-57E0-449F-A7CD-132717C2DF23">
+      <RegistryKey Root="HKLM" Key="Software\Classes\AppUserModelId\RemoteDesk">
+        <RegistryValue Type="string" Name="DisplayName" Value="RemoteDesk" KeyPath="yes" />
+        <RegistryValue Type="string" Name="IconUri" Value="[INSTALLFOLDER]app.ico" />
+        <RegistryValue Type="string" Name="IconBackgroundColor" Value="0" />
+        <RegistryValue Type="integer" Name="ShowInSettings" Value="1" />
+      </RegistryKey>
+    </Component>
+
+    <SetProperty Id="CA_UpdateShortcutIcon"
+                 Value="&quot;powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -Command &quot;$arr = @('[ApplicationProgramsFolder]RemoteDesk.lnk', '[DesktopFolder]RemoteDesk.lnk'); foreach ($p in $arr) { if (Test-Path $p) { $s = (New-Object -ComObject WScript.Shell).CreateShortcut($p); $ico = '[INSTALLFOLDER]app.ico'; if (Test-Path $ico) { $s.IconLocation = '$ico,0'; $s.Save() } } }&quot;"
+                 Before="CA_UpdateShortcutIcon"
+                 Sequence="execute" />
+    <CustomAction Id="CA_UpdateShortcutIcon"
+                  BinaryRef="Wix4UtilCA_X64"
+                  DllEntry="WixQuietExec64"
+                  Execute="deferred"
+                  Return="ignore"
+                  Impersonate="no" />
+
+    <InstallExecuteSequence>
+      <Custom Action="CA_UpdateShortcutIcon" After="CreateShortcuts" Condition="NOT Installed" />
+    </InstallExecuteSequence>
+
+    <Feature Id="MainFeature" Title="RemoteDesk" Level="1">
+      <ComponentGroupRef Id="ProductFiles" />
+      <ComponentRef Id="DesktopShortcut" />
+      <ComponentRef Id="RegistryAppUserModelId" />
+    </Feature>
+
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+  </Package>
+</Wix>

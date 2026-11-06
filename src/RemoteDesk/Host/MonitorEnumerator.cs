@@ -17,14 +17,19 @@ internal static class MonitorEnumerator
             int dpi = 96;
             try { if (Win32.GetDpiForMonitor(hMon, 0, out var dx, out _) == 0) dpi = (int)dx; } catch { }
             var friendly = GetFriendlyName(mi.szDevice);
-            var m = Regex.Match(mi.szDevice, @"(\d+)$");
-            int number = m.Success ? int.Parse(m.Groups[1].Value) : list.Count + 1;
-            list.Add(new MonitorInfo(mi.szDevice, friendly, number,
+            list.Add(new MonitorInfo(mi.szDevice, friendly, 0,
                 mi.rcMonitor.Left, mi.rcMonitor.Top, mi.rcMonitor.Width, mi.rcMonitor.Height,
                 (mi.dwFlags & Win32.MONITORINFOF_PRIMARY) != 0, dpi));
             return true;
         }, IntPtr.Zero);
-        return list.OrderBy(m => m.X).ThenBy(m => m.Y).ToList();
+
+        // 依螢幕水平座標由左至右統一依序編號為 1, 2, 3... (避免 Windows 裝置名稱如 \\.\DISPLAY5 導致編號跳號)
+        var ordered = list.OrderBy(m => m.X).ThenBy(m => m.Y).ToList();
+        for (int i = 0; i < ordered.Count; i++)
+        {
+            ordered[i] = ordered[i] with { Number = i + 1 };
+        }
+        return ordered;
     }
 
     private static string GetFriendlyName(string deviceName)

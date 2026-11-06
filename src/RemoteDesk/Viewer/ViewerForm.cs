@@ -38,6 +38,7 @@ internal sealed class ViewerForm : Form
     private int _frameCount;
     private long _lastFpsTime;
     private bool _clipboardUpdating;
+    private bool _thumbnailSaved;
 
     public ViewerForm(ViewerSession session)
     {
@@ -46,7 +47,7 @@ internal sealed class ViewerForm : Form
         Text = $"RemoteDesk - {session.HostDeviceName} ({AppConfig.FormatId(session.HostDeviceId)})";
         Size = new Size(1280, 800);
         StartPosition = FormStartPosition.CenterScreen;
-        Icon = SystemIcons.Application;
+        AppBranding.ApplyToForm(this);
         KeyPreview = true;
 
         // 1. 桌面畫布
@@ -311,7 +312,33 @@ internal sealed class ViewerForm : Form
         {
             _canvas.RecalculateLayout();
             _canvas.Invalidate();
+
+            if (seq >= 2 && !_thumbnailSaved)
+            {
+                _thumbnailSaved = true;
+                TrySaveThumbnail();
+            }
         });
+    }
+
+    private void TrySaveThumbnail()
+    {
+        try
+        {
+            using var thumb = _session.Decoder.CreateThumbnail(280, 158);
+            if (thumb != null)
+            {
+                var dir = Path.Combine(AppConfig.DataDirectory, "thumbnails");
+                Directory.CreateDirectory(dir);
+                var safeId = !string.IsNullOrEmpty(_session.HostDeviceId) ? _session.HostDeviceId : _session.TargetIdOrHost.Replace(":", "_");
+                var path = Path.Combine(dir, $"{safeId}.jpg");
+                thumb.Save(path, System.Drawing.Imaging.ImageFormat.Jpeg);
+
+                var cfg = ViewerConfig.Load();
+                cfg.UpdateThumbnail(_session.TargetIdOrHost, _session.HostDeviceId, path);
+            }
+        }
+        catch { }
     }
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
@@ -370,6 +397,7 @@ internal sealed class ViewerForm : Form
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        TrySaveThumbnail();
         _keyboardHook?.Dispose();
         _keyboardHook = null;
         _imeClient.Dispose();

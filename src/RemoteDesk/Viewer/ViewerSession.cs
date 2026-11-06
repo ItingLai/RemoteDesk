@@ -10,6 +10,21 @@ using RemoteDesk.Net;
 
 namespace RemoteDesk.Viewer;
 
+/// <summary>
+/// 當目標遠端設備已啟用密碼保護，但控制端尚未提供密碼時拋出之例外。
+/// 繼承自 UnauthorizedAccessException 以保持相容。
+/// </summary>
+public class NeedPasswordException : UnauthorizedAccessException
+{
+    public bool AllowInteractive { get; }
+
+    public NeedPasswordException(bool allowInteractive, string message = "此主機已設定連線密碼保護，請輸入連線密碼。")
+        : base(message)
+    {
+        AllowInteractive = allowInteractive;
+    }
+}
+
 internal sealed class ViewerSession : IDisposable
 {
     private readonly ViewerConfig _config;
@@ -22,6 +37,15 @@ internal sealed class ViewerSession : IDisposable
     private Task? _recvTask;
     private Task? _pingTask;
     private bool _disposed;
+    private int _disconnectedFired;
+
+    private void FireDisconnected(string reason)
+    {
+        if (Interlocked.Exchange(ref _disconnectedFired, 1) == 0)
+        {
+            Disconnected?.Invoke(reason);
+        }
+    }
 
     public FrameDecoder Decoder => _decoder;
     public bool IsConnected => _channel != null && !_cts.IsCancellationRequested;
@@ -55,7 +79,7 @@ internal sealed class ViewerSession : IDisposable
     /// <summary>
     /// 連線至被控端電腦（自動解析 9 位數 Device ID 或 IP 地址）。
     /// </summary>
-    public async Task ConnectAsync(string? password, CancellationToken ct)
+    public async Task ConnectAsync(string? password, CancellationToken ct, bool forceInteractive = false)
     {
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _cts.Token);
         var token = linkedCts.Token;
@@ -115,22 +139,37 @@ internal sealed class ViewerSession : IDisposable
         }
 
         // 2. 身份驗證
-        if (!string.IsNullOrEmpty(password))
+        if (forceInteractive)
+        {
+            if (!hello.AllowInteractive)
+            {
+                throw new InvalidOperationException("此主機未啟用互動授權連線，必須使用無人值守密碼連線。");
+            }
+            Log.Info($"使用者選擇發起互動授權，安全驗證碼: {channel.VerificationCode}，等待對方按「允許」...");
+            var authMsg = new PacketWriter((byte)AuthMethod.RequestAccess).ToArray();
+            await channel.SendAsync(authMsg, token).ConfigureAwait(false);
+        }
+        else if (!string.IsNullOrEmpty(password))
         {
             var key = Crypto.DerivePasswordKey(password, hello.Salt, hello.Iterations);
             var proof = Crypto.PasswordProof(key, channel.Transcript);
             var authMsg = new PacketWriter((byte)AuthMethod.Password).Bytes(proof).ToArray();
             await channel.SendAsync(authMsg, token).ConfigureAwait(false);
         }
-        else
+        else if (hello.HasPassword)
         {
-            if (!hello.AllowInteractive)
-            {
-                throw new InvalidOperationException("此主機未啟用無密碼互動授權，請輸入連線密碼。");
-            }
-            Log.Info($"主機需要互動授權，安全驗證碼: {channel.VerificationCode}，等待對方按「允許」...");
+            // 主機已設定密碼，控制端尚未輸入密碼 -> 觸發輸入密碼對話盒
+            throw new NeedPasswordException(hello.AllowInteractive, "此主機已設定連線密碼，請輸入連線密碼。");
+        }
+        else if (hello.AllowInteractive)
+        {
+            Log.Info($"主機未設定密碼，需要互動授權，安全驗證碼: {channel.VerificationCode}，等待對方按「允許」...");
             var authMsg = new PacketWriter((byte)AuthMethod.RequestAccess).ToArray();
             await channel.SendAsync(authMsg, token).ConfigureAwait(false);
+        }
+        else
+        {
+            throw new InvalidOperationException("此主機未設定連線密碼，且未開放互動授權連線。");
         }
 
         var resp = await channel.ReceiveAsync(token).ConfigureAwait(false);
@@ -168,7 +207,7 @@ internal sealed class ViewerSession : IDisposable
         catch (Exception ex)
         {
             Log.Info($"與遠端主機的連線中斷: {ex.Message}");
-            Disconnected?.Invoke(ex.Message);
+            FireDisconnected(ex.Message);
         }
         finally
         {
@@ -181,6 +220,13 @@ internal sealed class ViewerSession : IDisposable
         var r = new PacketReader(msg.AsSpan(1));
         switch ((HostMsg)msg[0])
         {
+            case HostMsg.Disconnect:
+            {
+                Log.Info("遠端主機已結束連線");
+                FireDisconnected("遠端主機已主動結束連線");
+                _cts.Cancel();
+                break;
+            }
             case HostMsg.MonitorList:
             {
                 var (list, selected) = MessageCodec.ReadMonitorList(ref r);
@@ -356,11 +402,30 @@ internal sealed class ViewerSession : IDisposable
     public void RequestKeyframe() =>
         _channel?.TrySendAsync(new PacketWriter((byte)ViewerMsg.RequestKeyframe, 1).ToArray());
 
+    public void SendDisconnect()
+    {
+        try
+        {
+            if (_channel != null && !_disposed)
+            {
+                var pkt = new PacketWriter((byte)ViewerMsg.Disconnect, 1).ToArray();
+                _channel.SendSync(pkt, timeoutMs: 300);
+            }
+        }
+        catch { }
+        finally
+        {
+            try { _tcp?.Client?.Shutdown(SocketShutdown.Both); } catch { }
+            _cts.Cancel();
+        }
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
         _cts.Cancel();
+        try { _tcp?.Client?.Shutdown(SocketShutdown.Both); } catch { }
         _channel?.Dispose();
         _tcp?.Dispose();
         _decoder.Dispose();

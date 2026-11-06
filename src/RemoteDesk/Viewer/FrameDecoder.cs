@@ -172,6 +172,23 @@ internal sealed unsafe class FrameDecoder : IDisposable
         }
     }
 
+    /// <summary>
+    /// 截取目前遠端桌面畫面作為縮圖（用於辨識裝置與最近連線記錄）。
+    /// </summary>
+    public Bitmap? CreateThumbnail(int thumbWidth = 240, int thumbHeight = 135)
+    {
+        lock (_renderLock)
+        {
+            if (_bitmap == null || _width <= 0 || _height <= 0) return null;
+            var thumb = new Bitmap(thumbWidth, thumbHeight, PixelFormat.Format32bppRgb);
+            using var g = Graphics.FromImage(thumb);
+            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBilinear;
+            g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
+            g.DrawImage(_bitmap, new Rectangle(0, 0, thumbWidth, thumbHeight), 0, 0, _width, _height, GraphicsUnit.Pixel);
+            return thumb;
+        }
+    }
+
     private void Cleanup()
     {
         _bitmap?.Dispose();

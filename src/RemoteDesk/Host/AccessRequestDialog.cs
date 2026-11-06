@@ -1,4 +1,6 @@
 using System.Drawing;
+using System.Windows.Forms;
+using RemoteDesk.Common;
 
 namespace RemoteDesk.Host;
 
@@ -22,20 +24,22 @@ internal sealed class AccessRequestDialog : Form
     public AccessRequestDialog(string viewerName, string viewerId, string address, string code)
     {
         Text = "RemoteDesk - 連線授權請求";
-        Size = new Size(460, 310);
+        Size = new Size(480, 320);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
         TopMost = true;
-        BackColor = Color.FromArgb(245, 245, 248);
-        Font = new Font("Microsoft JhengHei UI", 9.5f, FontStyle.Regular);
+        BackColor = Theme.Background;
+        ForeColor = Theme.TextPrimary;
+        Font = Theme.BodyFont;
+        AppBranding.ApplyToForm(this);
 
         var lblTitle = new Label
         {
             Text = "收到遠端桌面連線請求",
-            Font = new Font("Microsoft JhengHei UI", 13f, FontStyle.Bold),
-            ForeColor = Color.FromArgb(30, 30, 30),
+            Font = Theme.CreateFont(13f, FontStyle.Bold),
+            ForeColor = Theme.TextPrimary,
             Location = new Point(24, 20),
             AutoSize = true
         };
@@ -43,24 +47,24 @@ internal sealed class AccessRequestDialog : Form
         _lblInfo = new Label
         {
             Text = $"來源名稱：{viewerName}\n裝置 ID  ：{viewerId}\n網路位址：{address}",
-            Location = new Point(24, 60),
-            Size = new Size(400, 65),
-            ForeColor = Color.FromArgb(60, 60, 60)
+            Location = new Point(24, 55),
+            Size = new Size(416, 65),
+            ForeColor = Theme.TextSecondary,
+            Font = Theme.CreateFont(9.5f)
         };
 
         var pnlCode = new Panel
         {
-            Location = new Point(24, 130),
-            Size = new Size(396, 55),
-            BackColor = Color.FromArgb(232, 240, 254),
-            BorderStyle = BorderStyle.FixedSingle
+            Location = new Point(24, 125),
+            Size = new Size(416, 52),
+            BackColor = Theme.SurfaceElevated
         };
 
         _lblCode = new Label
         {
             Text = $"安全確認碼：{code[..3]} {code[3..]}",
-            Font = new Font("Consolas", 14f, FontStyle.Bold),
-            ForeColor = Color.FromArgb(26, 115, 232),
+            Font = Theme.CreateFont(13f, FontStyle.Bold),
+            ForeColor = Theme.Accent,
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleCenter
         };
@@ -69,40 +73,45 @@ internal sealed class AccessRequestDialog : Form
         _lblTimer = new Label
         {
             Text = "30 秒後自動拒絕...",
-            Location = new Point(24, 195),
+            Location = new Point(24, 190),
             AutoSize = true,
-            ForeColor = Color.Gray
+            ForeColor = Theme.TextSecondary,
+            Font = Theme.SmallFont
         };
 
         _btnAccept = new Button
         {
-            Text = "接受 (允許控制)",
+            Text = "✓ 接受 (允許控制)",
             DialogResult = DialogResult.OK,
-            Location = new Point(160, 225),
-            Size = new Size(130, 36),
-            BackColor = Color.FromArgb(46, 125, 50),
+            Location = new Point(165, 225),
+            Size = new Size(165, 38),
+            BackColor = Theme.Success,
             ForeColor = Color.White,
             FlatStyle = FlatStyle.Flat,
-            Font = new Font("Microsoft JhengHei UI", 10f, FontStyle.Bold)
+            Font = Theme.CreateFont(9.5f, FontStyle.Bold),
+            Cursor = Cursors.Hand
         };
         _btnAccept.FlatAppearance.BorderSize = 0;
         _btnAccept.Click += (_, _) => { IsAccepted = true; Close(); };
 
         _btnReject = new Button
         {
-            Text = "拒絕",
+            Text = "✕ 拒絕",
             DialogResult = DialogResult.Cancel,
-            Location = new Point(300, 225),
-            Size = new Size(120, 36),
-            BackColor = Color.FromArgb(211, 47, 47),
+            Location = new Point(340, 225),
+            Size = new Size(100, 38),
+            BackColor = Theme.Danger,
             ForeColor = Color.White,
             FlatStyle = FlatStyle.Flat,
-            Font = new Font("Microsoft JhengHei UI", 10f, FontStyle.Bold)
+            Font = Theme.CreateFont(9.5f, FontStyle.Bold),
+            Cursor = Cursors.Hand
         };
         _btnReject.FlatAppearance.BorderSize = 0;
         _btnReject.Click += (_, _) => { IsAccepted = false; Close(); };
 
         Controls.AddRange(new Control[] { lblTitle, _lblInfo, pnlCode, _lblTimer, _btnAccept, _btnReject });
+        AcceptButton = _btnAccept;
+        CancelButton = _btnReject;
 
         _timer = new System.Windows.Forms.Timer { Interval = 1000 };
         _timer.Tick += (_, _) =>

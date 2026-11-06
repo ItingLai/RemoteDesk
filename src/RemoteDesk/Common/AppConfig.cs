@@ -91,6 +91,10 @@ internal sealed class RecentEntry
     public string? LastAddress { get; set; }   // 最後一次成功連線的 IP
     public int Port { get; set; } = Protocol.DefaultTcpPort;
     public DateTime LastUsed { get; set; }
+    public string? ThumbnailPath { get; set; } // 被連線裝置的桌布/畫面縮圖
+    public bool IsFavorite { get; set; }       // 是否加入我的最愛 (規格 4.6)
+    public int DurationSeconds { get; set; }   // 連線持續秒數 (規格 8)
+    public string? DisconnectReason { get; set; } // 中斷原因
 }
 
 /// <summary>控制端（檢視端）設定，存放在使用者的 %APPDATA%\RemoteDesk\viewer.json。</summary>
@@ -106,6 +110,10 @@ internal sealed class ViewerConfig
     public bool FitToWindow { get; set; } = true;
     public bool SyncClipboard { get; set; } = true;
     public string ViewerId { get; set; } = "";
+    public string ThemeMode { get; set; } = "Dark";      // Dark / Light / System (規格 2.2)
+    public string Language { get; set; } = "zh-TW";      // 規格 6.2
+    public bool StartWithWindows { get; set; } = false;
+    public bool MinimizeToTray { get; set; } = true;
 
     public static string FilePath => Path.Combine(AppConfig.DataDirectory, "viewer.json");
 
@@ -168,8 +176,42 @@ internal sealed class ViewerConfig
         existing.LastAddress = address ?? existing.LastAddress;
         existing.Port = port;
         existing.LastUsed = DateTime.Now;
-        Recent = Recent.OrderByDescending(r => r.LastUsed).Take(30).ToList();
+        Recent = Recent.OrderByDescending(r => r.LastUsed).Take(50).ToList();
     }
+
+    public void UpdateThumbnail(string key, string? deviceId, string thumbPath)
+    {
+        var existing = Recent.FirstOrDefault(r =>
+            (deviceId != null && r.DeviceId == deviceId) || string.Equals(r.Key, key, StringComparison.OrdinalIgnoreCase));
+        if (existing != null)
+        {
+            existing.ThumbnailPath = thumbPath;
+            Save();
+        }
+    }
+
+    public void ToggleFavorite(string key)
+    {
+        var existing = Recent.FirstOrDefault(r =>
+            string.Equals(r.Key, key, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(r.DeviceId, key, StringComparison.OrdinalIgnoreCase));
+        if (existing != null)
+        {
+            existing.IsFavorite = !existing.IsFavorite;
+            Save();
+        }
+    }
+
+    public void RemoveRecent(string key)
+    {
+        Recent.RemoveAll(r =>
+            string.Equals(r.Key, key, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(r.DeviceId, key, StringComparison.OrdinalIgnoreCase));
+        Save();
+    }
+
+    public List<RecentEntry> GetRecent() => Recent.OrderByDescending(r => r.LastUsed).ToList();
+    public List<RecentEntry> GetFavorites() => Recent.Where(r => r.IsFavorite).OrderByDescending(r => r.LastUsed).ToList();
 }
 
 internal static class AppConfig
@@ -236,4 +278,36 @@ internal static class AppConfig
 
     public static string FormatId(string id) =>
         id.Length == 9 ? $"{id[..3]} {id[3..6]} {id[6..]}" : id;
+
+    public static void SetStartupWithWindows(bool enable)
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true);
+            if (key == null) return;
+            if (enable)
+            {
+                var exePath = Environment.ProcessPath ?? Application.ExecutablePath;
+                key.SetValue("RemoteDesk", $"\"{exePath}\"");
+            }
+            else
+            {
+                key.DeleteValue("RemoteDesk", false);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("設定開機自啟動失敗: " + ex.Message);
+        }
+    }
+
+    public static bool IsStartupWithWindows()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", false);
+            return key?.GetValue("RemoteDesk") != null;
+        }
+        catch { return false; }
+    }
 }

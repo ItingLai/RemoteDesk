@@ -27,6 +27,7 @@ internal enum HostMsg : byte
     Caret = 0x08,
     Notice = 0x09,
     StreamInfo = 0x0A,
+    Disconnect = 0x0B,
 }
 
 /// <summary>檢視端 → 主機訊息。</summary>
@@ -48,6 +49,7 @@ internal enum ViewerMsg : byte
     ImeMode = 0x4E,
     ReleaseAll = 0x4F,
     RequestKeyframe = 0x50,
+    Disconnect = 0x51,
 }
 
 internal enum MouseButtonId : byte { Left = 0, Right = 1, Middle = 2, X1 = 3, X2 = 4 }

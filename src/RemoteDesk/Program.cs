@@ -10,6 +10,13 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        // 設定應用程式專屬 AppUserModelID 與捷徑圖標關聯，以利 Windows 10/11 系統通知 Attribution Area 精確呈現品牌 Logo
+        try
+        {
+            AppBranding.EnsureShortcutAndIdentity();
+        }
+        catch { }
+
         ApplicationConfiguration.Initialize();
 
         // 檢查命令列參數
@@ -20,13 +27,34 @@ internal static class Program
                 MessageBox.Show(
                     "RemoteDesk 內網原生遠端桌面\n\n" +
                     "用法：\n" +
-                    "  RemoteDesk.exe                    啟動圖形介面主程式\n" +
-                    "  RemoteDesk.exe --connect <ID/IP>   直接連線至指定遠端主機\n" +
-                    "  RemoteDesk.exe --headless          無介面背景服務模式\n",
+                    "  RemoteDesk.exe                                  啟動圖形介面主程式\n" +
+                    "  RemoteDesk.exe --connect <ID/IP>                 直接連線至指定遠端主機\n" +
+                    "  RemoteDesk.exe --profile <名稱> --port <連接埠>   多開獨立實例 (單機測試必備)\n" +
+                    "  RemoteDesk.exe --headless                        無介面背景服務模式\n",
                     "RemoteDesk 說明",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Information);
                 return;
+            }
+
+            int profileIdx = Array.IndexOf(args, "--profile");
+            if (profileIdx >= 0 && profileIdx + 1 < args.Length)
+            {
+                string profile = args[profileIdx + 1];
+                var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "RemoteDesk", "Profiles", profile);
+                AppConfig.OverrideDataDirectory(dir);
+            }
+
+            int portIdx = Array.IndexOf(args, "--port");
+            if (portIdx >= 0 && portIdx + 1 < args.Length && int.TryParse(args[portIdx + 1], out int customPort))
+            {
+                var hostCfg = HostConfig.Load();
+                hostCfg.TcpPort = customPort;
+                if (profileIdx >= 0 && profileIdx + 1 < args.Length)
+                {
+                    hostCfg.DeviceName = $"{Environment.MachineName} [{args[profileIdx + 1]}]";
+                }
+                hostCfg.TrySave();
             }
 
             int connectIdx = Array.IndexOf(args, "--connect");

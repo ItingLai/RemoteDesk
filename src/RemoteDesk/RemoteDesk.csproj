@@ -9,10 +9,11 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <ApplicationIcon>app.ico</ApplicationIcon>
     <AssemblyName>RemoteDesk</AssemblyName>
     <RootNamespace>RemoteDesk</RootNamespace>
     <Version>1.0.0</Version>
-    <Product>RemoteDesk 內網遠端桌面</Product>
+    <Product>RemoteDesk</Product>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <NoWarn>$(NoWarn);CA1416;WFO1000</NoWarn>
   </PropertyGroup>
@@ -26,6 +27,14 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="RemoteDesk.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="app.ico" />
+    <None Update="app.ico" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <EmbeddedResource Include="Resources\logo.png" />
+    <EmbeddedResource Include="Resources\logo_24.png" />
+    <EmbeddedResource Include="Resources\logo_32.png" />
   </ItemGroup>
 
 </Project>

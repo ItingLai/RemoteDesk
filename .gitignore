@@ -1,9 +1,25 @@
-## .NET
+## .NET / Visual Studio
 bin/
 obj/
 publish/
-*.user
-*.suo
 .vs/
 .idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## Build & Release Artifacts
+dist/
+*.cab
+*.wixpdb
+installer/cache/
+
+## Logs & Temporary Files
 *.log
+test_run.log
+
+## Test & Debug Scripts
+test.bat
+啟動-單機雙開測試.bat
+啟動-單機雙開測試.ps1

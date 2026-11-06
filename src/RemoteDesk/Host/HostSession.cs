@@ -63,7 +63,21 @@ internal sealed class HostSession : IDisposable
         RemoteAddress = remoteAddress;
     }
 
-    public void Disconnect() => _cts.Cancel();
+    public void Disconnect()
+    {
+        try
+        {
+            var pkt = new PacketWriter((byte)HostMsg.Disconnect, 1).ToArray();
+            _ch.SendSync(pkt, timeoutMs: 300);
+        }
+        catch { }
+        finally
+        {
+            _cts.Cancel();
+            _ackEvent.Set();
+            _ch.Dispose();
+        }
+    }
 
     public Task SendClipboardAsync(string text) =>
         _ch.TrySendAsync(new PacketWriter((byte)HostMsg.Clipboard).Str(text).ToArray());
@@ -88,7 +102,7 @@ internal sealed class HostSession : IDisposable
         {
             _cts.Cancel();
             _ackEvent.Set();
-            captureThread.Join(3000);
+            captureThread.Join(150);
             _input.Post(_injector.ReleaseAll);
             _input.Dispose();
             _ch.Dispose();
@@ -99,11 +113,19 @@ internal sealed class HostSession : IDisposable
     private async Task ReceiveLoopAsync()
     {
         var ct = _cts.Token;
-        while (!ct.IsCancellationRequested)
+        try
         {
-            var msg = await _ch.ReceiveAsync(ct).ConfigureAwait(false);
-            if (msg.Length == 0) continue;
-            Dispatch(msg);
+            while (!ct.IsCancellationRequested)
+            {
+                var msg = await _ch.ReceiveAsync(ct).ConfigureAwait(false);
+                if (msg.Length == 0) continue;
+                Dispatch(msg);
+            }
+        }
+        finally
+        {
+            _cts.Cancel();
+            _ackEvent.Set();
         }
     }
 
@@ -112,6 +134,14 @@ internal sealed class HostSession : IDisposable
         var r = new PacketReader(msg.AsSpan(1));
         switch ((ViewerMsg)msg[0])
         {
+            case ViewerMsg.Disconnect:
+            {
+                Log.Info($"控制端 {ViewerName} 要求中斷連線");
+                _cts.Cancel();
+                _ackEvent.Set();
+                _ch.Dispose();
+                break;
+            }
             case ViewerMsg.MouseMove:
             {
                 int x = r.I32(), y = r.I32();

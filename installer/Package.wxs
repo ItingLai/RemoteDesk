@@ -3,7 +3,7 @@
      xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Package Name="RemoteDesk"
            Manufacturer="RemoteDesk"
-           Version="1.0.1.0"
+           Version="1.0.1"
            UpgradeCode="E72B91F1-0C53-4E22-90D1-4E48FDADF544"
            Scope="perMachine"
            Language="1028"

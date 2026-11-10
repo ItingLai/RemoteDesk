@@ -501,11 +501,27 @@ internal sealed class DeviceThumbnailCard : Panel
     private readonly Action<string, string>? _onRename;
     private Image? _thumbnail;
     private bool _isHovered;
+    private bool _isOnline;
+    private readonly ToolTip _statusToolTip = new() { InitialDelay = 150 };
     private const int Radius = Theme.CornerRadius; // 10px
 
-    public DeviceThumbnailCard(RecentEntry entry, Action<string> onConnect, Action<string> onToggleFavorite, Action<string> onRemove, Action<string, string>? onRename = null)
+    public bool IsOnline
+    {
+        get => _isOnline;
+        set
+        {
+            if (_isOnline != value)
+            {
+                _isOnline = value;
+                Invalidate();
+            }
+        }
+    }
+
+    public DeviceThumbnailCard(RecentEntry entry, bool isOnline, Action<string> onConnect, Action<string> onToggleFavorite, Action<string> onRemove, Action<string, string>? onRename = null)
     {
         _entry = entry;
+        _isOnline = isOnline;
         _onConnect = onConnect;
         _onToggleFavorite = onToggleFavorite;
         _onRemove = onRemove;
@@ -522,10 +538,36 @@ internal sealed class DeviceThumbnailCard : Panel
 
         MouseEnter += (_, _) => { _isHovered = true; Invalidate(); };
         MouseLeave += (_, _) => { _isHovered = false; Invalidate(); };
+        MouseMove += (s, e) =>
+        {
+            var statusRect = new Rectangle(6, 6, 22, 22);
+            if (statusRect.Contains(e.Location))
+            {
+                string text = _isOnline ? "可連線 (就緒)" : "設備離線";
+                if (_statusToolTip.GetToolTip(this) != text)
+                {
+                    _statusToolTip.SetToolTip(this, text);
+                }
+            }
+            else
+            {
+                string idText = !string.IsNullOrEmpty(_entry.DeviceId) ? AppConfig.FormatId(_entry.DeviceId) : _entry.Key;
+                string tip = $"連線至 {idText}";
+                if (_statusToolTip.GetToolTip(this) != tip)
+                {
+                    _statusToolTip.SetToolTip(this, tip);
+                }
+            }
+        };
         Click += (_, _) => _onConnect(_entry.Key);
 
         // 右鍵管理選單 (規格 4.6)
         ContextMenuStrip = CreateContextMenu();
+    }
+
+    public DeviceThumbnailCard(RecentEntry entry, Action<string> onConnect, Action<string> onToggleFavorite, Action<string> onRemove, Action<string, string>? onRename = null)
+        : this(entry, false, onConnect, onToggleFavorite, onRemove, onRename)
+    {
     }
 
     private ContextMenuStrip CreateContextMenu()
@@ -568,15 +610,102 @@ internal sealed class DeviceThumbnailCard : Panel
 
     private void LoadThumbnail()
     {
-        if (!string.IsNullOrEmpty(_entry.ThumbnailPath) && File.Exists(_entry.ThumbnailPath))
+        string? path = _entry.ThumbnailPath;
+        if (string.IsNullOrEmpty(path) || !File.Exists(path))
+        {
+            string id = !string.IsNullOrEmpty(_entry.DeviceId) ? _entry.DeviceId : _entry.Key;
+            string candidate = Path.Combine(AppConfig.DataDirectory, "thumbnails", $"{id}.jpg");
+            if (File.Exists(candidate))
+            {
+                path = candidate;
+            }
+        }
+
+        if (!string.IsNullOrEmpty(path) && File.Exists(path))
         {
             try
             {
-                var bytes = File.ReadAllBytes(_entry.ThumbnailPath);
+                var bytes = File.ReadAllBytes(path);
                 using var ms = new MemoryStream(bytes);
                 _thumbnail = Image.FromStream(ms);
             }
             catch { }
+        }
+    }
+
+    /// <summary>
+    /// 依據需求 4：若尚未自被控端取得單純桌布，繪製簡潔俐落的純色桌布底色，不自行繪製任何假圖示或假工作列。
+    /// </summary>
+    private void DrawPureDefaultWallpaper(Graphics g, Rectangle bounds)
+    {
+        int hash = Math.Abs((_entry.DeviceId ?? _entry.Key).GetHashCode());
+        Color cTop, cBot;
+        switch (hash % 4)
+        {
+            case 0:
+                cTop = Color.FromArgb(15, 23, 42);   // Slate 900
+                cBot = Color.FromArgb(30, 58, 138);  // Blue 900
+                break;
+            case 1:
+                cTop = Color.FromArgb(17, 24, 39);   // Gray 900
+                cBot = Color.FromArgb(49, 46, 129);  // Indigo 900
+                break;
+            case 2:
+                cTop = Color.FromArgb(19, 21, 26);
+                cBot = Color.FromArgb(15, 76, 92);
+                break;
+            default:
+                cTop = Color.FromArgb(24, 24, 27);   // Zinc 900
+                cBot = Color.FromArgb(39, 39, 42);   // Zinc 800
+                break;
+        }
+
+        using var brush = new LinearGradientBrush(bounds, cTop, cBot, 55f);
+        g.FillRectangle(brush, bounds);
+    }
+
+    /// <summary>
+    /// 在設備圖片的左上角繪製設備狀態燈號（依據需求 5：綠色燈號為可連線(就緒)，紅色燈號帶有禁止符號為(設備離線)）。
+    /// </summary>
+    private void DrawStatusLight(Graphics g)
+    {
+        int x = 8;
+        int y = 8;
+        int size = 16;
+        var rect = new Rectangle(x, y, size, size);
+
+        if (_isOnline)
+        {
+            // 綠色燈號：就緒 / 可連線
+            using var glowBrush = new SolidBrush(Color.FromArgb(70, 34, 197, 94));
+            g.FillEllipse(glowBrush, x - 2, y - 2, size + 4, size + 4);
+
+            using var greenBrush = new SolidBrush(Color.FromArgb(255, 34, 197, 94));
+            g.FillEllipse(greenBrush, rect);
+
+            using var hlPen = new Pen(Color.FromArgb(180, 255, 255, 255), 1.2f);
+            g.DrawArc(hlPen, x + 2, y + 2, size - 4, size - 4, 200, 70);
+
+            using var borderPen = new Pen(Color.FromArgb(120, 0, 0, 0), 1f);
+            g.DrawEllipse(borderPen, rect);
+        }
+        else
+        {
+            // 紅色燈號帶有禁止符號：設備離線
+            using var bgBrush = new SolidBrush(Color.FromArgb(210, 24, 24, 27));
+            g.FillEllipse(bgBrush, rect);
+
+            using var redPen = new Pen(Color.FromArgb(239, 68, 68), 2f);
+            g.DrawEllipse(redPen, x + 1, y + 1, size - 2, size - 2);
+
+            float cx = x + size / 2f;
+            float cy = y + size / 2f;
+            float r = (size - 2) / 2f;
+            float offset = r * 0.7071f;
+            g.DrawLine(redPen, cx - offset, cy - offset, cx + offset, cy + offset);
+
+            using var borderPen = new Pen(Color.FromArgb(120, 0, 0, 0), 1f);
+            g.DrawEllipse(borderPen, rect);
         }
     }
 
@@ -592,7 +721,7 @@ internal sealed class DeviceThumbnailCard : Panel
         using var bgBrush = new SolidBrush(Theme.Surface);
         g.FillPath(bgBrush, cardPath);
 
-        // 2. 16:9 桌面縮圖 (寬 216，高 122)
+        // 2. 16:9 桌面代表圖片 (寬 216，高 122)
         var thumbBounds = new Rectangle(0, 0, Width, 122);
         var oldClip = g.Clip;
         using var thumbClipPath = new GraphicsPath();
@@ -602,29 +731,21 @@ internal sealed class DeviceThumbnailCard : Panel
         thumbClipPath.CloseFigure();
         g.SetClip(thumbClipPath);
 
+        // 依據需求 4：設備代表圖片改採用設備的桌面，直接取用被控端的單純桌布，而不是自己繪製
         if (_thumbnail != null)
         {
-            g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
             g.DrawImage(_thumbnail, thumbBounds);
         }
         else
         {
-            // 規格 4.6：縮圖尚未取得時，顯示預設桌面 Placeholder
-            using var grad = new LinearGradientBrush(thumbBounds, Theme.SurfaceElevated, Theme.Surface, 45f);
-            g.FillRectangle(grad, thumbBounds);
-
-            // 繪製電腦螢幕線條圖示
-            using var pen = new Pen(Theme.Border, 1.8f);
-            g.DrawRectangle(pen, (Width - 44) / 2, 36, 44, 28);
-            g.DrawLine(pen, Width / 2, 64, Width / 2, 74);
-            g.DrawLine(pen, Width / 2 - 12, 74, Width / 2 + 12, 74);
-
-            using var font = Theme.SmallFont;
-            using var brush = new SolidBrush(Theme.TextSecondary);
-            var tip = "Desktop";
-            var sz = g.MeasureString(tip, font);
-            g.DrawString(tip, font, brush, (Width - sz.Width) / 2, 82);
+            DrawPureDefaultWallpaper(g, thumbBounds);
         }
+
+        // 繪製設備狀態燈號（依據需求 5）
+        DrawStatusLight(g);
+
         g.Clip = oldClip;
 
         // 若為我的最愛，於縮圖右上角顯示精巧星號標記
@@ -684,13 +805,14 @@ internal sealed class DeviceThumbnailCard : Panel
         {
             _thumbnail?.Dispose();
             _thumbnail = null;
+            _statusToolTip.Dispose();
         }
         base.Dispose(disposing);
     }
 }
 
 /// <summary>
-/// 依據規格 4.6：Recent Sessions / Favorites 頁籤切換器。
+/// 依據規格 4.6 與需求 3：連線紀錄 / 我的最愛 / 區域網內設備 頁籤切換器。
 /// 整合在同一個內容區域，使用頁籤無縫切換。
 /// </summary>
 internal sealed class DeviceTabsControl : Panel
@@ -698,6 +820,7 @@ internal sealed class DeviceTabsControl : Panel
     private int _selectedIndex;
     private int _recentCount;
     private int _favCount;
+    private int _lanCount;
 
     public event Action<int>? TabChanged;
 
@@ -715,12 +838,15 @@ internal sealed class DeviceTabsControl : Panel
         }
     }
 
-    public void UpdateCounts(int recentCount, int favCount)
+    public void UpdateCounts(int recentCount, int favCount, int lanCount)
     {
         _recentCount = recentCount;
         _favCount = favCount;
+        _lanCount = lanCount;
         Invalidate();
     }
+
+    public void UpdateCounts(int recentCount, int favCount) => UpdateCounts(recentCount, favCount, 0);
 
     public DeviceTabsControl()
     {
@@ -730,16 +856,40 @@ internal sealed class DeviceTabsControl : Panel
         Cursor = Cursors.Hand;
     }
 
+    private (Rectangle rect, string text)[] GetTabs(Graphics g, Font activeFont, Font inactiveFont)
+    {
+        string tab1 = $"連線紀錄 ({_recentCount})";
+        string tab2 = $"我的最愛 ({_favCount})";
+        string tab3 = $"區域網內設備 ({_lanCount})";
+
+        string[] titles = { tab1, tab2, tab3 };
+        var list = new (Rectangle rect, string text)[3];
+        int x = 8;
+        for (int i = 0; i < 3; i++)
+        {
+            var font = i == _selectedIndex ? activeFont : inactiveFont;
+            var sz = g.MeasureString(titles[i], font);
+            int w = (int)Math.Ceiling(sz.Width);
+            list[i] = (new Rectangle(x, 0, w + 16, Height), titles[i]);
+            x += w + 24;
+        }
+        return list;
+    }
+
     protected override void OnMouseDown(MouseEventArgs e)
     {
         base.OnMouseDown(e);
-        if (e.X < 160)
+        using var g = CreateGraphics();
+        using var fontActive = Theme.CreateFont(10.5f, FontStyle.Bold);
+        using var fontInactive = Theme.CreateFont(10.5f, FontStyle.Regular);
+        var tabs = GetTabs(g, fontActive, fontInactive);
+        for (int i = 0; i < tabs.Length; i++)
         {
-            SelectedIndex = 0; // Recent
-        }
-        else if (e.X < 320)
-        {
-            SelectedIndex = 1; // Favorites
+            if (e.X >= tabs[i].rect.Left && e.X <= tabs[i].rect.Right)
+            {
+                SelectedIndex = i;
+                break;
+            }
         }
     }
 
@@ -748,35 +898,28 @@ internal sealed class DeviceTabsControl : Panel
         var g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
 
-        // Tab 1: Recent Sessions
-        string tab1 = $"Recent Sessions ({_recentCount})";
-        string tab2 = $"Favorites ({_favCount})";
-
         using var fontActive = Theme.CreateFont(10.5f, FontStyle.Bold);
         using var fontInactive = Theme.CreateFont(10.5f, FontStyle.Regular);
 
-        // Draw Tab 1
-        var brush1 = _selectedIndex == 0 ? new SolidBrush(Theme.TextPrimary) : new SolidBrush(Theme.TextSecondary);
-        g.DrawString(tab1, _selectedIndex == 0 ? fontActive : fontInactive, brush1, 8, 8);
-        brush1.Dispose();
+        var tabs = GetTabs(g, fontActive, fontInactive);
 
-        // Draw Tab 2
-        var brush2 = _selectedIndex == 1 ? new SolidBrush(Theme.TextPrimary) : new SolidBrush(Theme.TextSecondary);
-        g.DrawString(tab2, _selectedIndex == 1 ? fontActive : fontInactive, brush2, 175, 8);
-        brush2.Dispose();
+        for (int i = 0; i < tabs.Length; i++)
+        {
+            bool active = i == _selectedIndex;
+            using var brush = new SolidBrush(active ? Theme.TextPrimary : Theme.TextSecondary);
+            var font = active ? fontActive : fontInactive;
+            g.DrawString(tabs[i].text, font, brush, tabs[i].rect.Left + 8, 8);
+        }
 
         // 底部指示條
         using var linePen = new Pen(Theme.Border, 1f);
         g.DrawLine(linePen, 0, Height - 1, Width, Height - 1);
 
-        using var activePen = new Pen(Theme.Primary, 3f);
-        if (_selectedIndex == 0)
+        if (_selectedIndex >= 0 && _selectedIndex < tabs.Length)
         {
-            g.DrawLine(activePen, 8, Height - 2, 155, Height - 2);
-        }
-        else
-        {
-            g.DrawLine(activePen, 175, Height - 2, 290, Height - 2);
+            using var activePen = new Pen(Theme.Primary, 3f);
+            var activeRect = tabs[_selectedIndex].rect;
+            g.DrawLine(activePen, activeRect.Left + 8, Height - 2, activeRect.Right - 8, Height - 2);
         }
     }
 }

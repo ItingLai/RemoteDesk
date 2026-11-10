@@ -21,6 +21,7 @@ internal enum HostMsg : byte
     MonitorList = 0x01,
     VideoFrame = 0x02,
     CursorShape = 0x03,
+    Wallpaper = 0x04,
     ImeState = 0x05,
     Clipboard = 0x06,
     Pong = 0x07,
@@ -219,4 +220,10 @@ internal static class MessageCodec
         new PacketWriter(type, 16).I64(s.KeyboardLayout).Bool(s.Open).I32(s.Conversion).ToArray();
 
     public static ImeState ReadIme(ref PacketReader r) => new(r.I64(), r.Bool(), r.I32());
+
+    public static byte[] Wallpaper(ReadOnlySpan<byte> jpeg) =>
+        new PacketWriter((byte)HostMsg.Wallpaper, jpeg.Length + 5).Bytes(jpeg).ToArray();
+
+    public static byte[] ReadWallpaper(ref PacketReader r) =>
+        r.Bytes().ToArray();
 }

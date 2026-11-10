@@ -37,7 +37,7 @@ namespace RemoteDesk;
 /// │  │ 123 456 789  │  │ 987 654 321  │  │ 456 789 123  │       │
 /// │  └──────────────┘  └──────────────┘  └──────────────┘       │
 /// ├──────────────────────────────────────────────────────────────┤
-/// │ ● Server Status: Online                 Version: 1.0.0      │
+/// │ ● Server Status: Online                 Version: 1.0.1      │
 /// └──────────────────────────────────────────────────────────────┘
 /// </summary>
 internal sealed class MainForm : Form, IHostUi
@@ -206,14 +206,23 @@ internal sealed class MainForm : Form, IHostUi
 
         _keyboardHook = new KeyboardHook(
             () => Form.ActiveForm == this && _currentSession != null && _currentSession.Canvas.Focused,
-            (vk, scan, flags) => _currentSession?.Session.SendKey(vk, scan, flags));
+            (vk, scan, flags) => _currentSession?.Session.SendKey(vk, scan, flags),
+            () => _isFullscreen,
+            () => BeginInvoke(ExitFullscreen));
     }
+
+    private System.Windows.Forms.Timer? _deviceRefreshTimer;
 
     protected override void OnLoad(EventArgs e)
     {
         base.OnLoad(e);
 
         _discovery.Start();
+        _discovery.DeviceUpdated += _ => BeginInvoke(() => { if (!IsDisposed) RefreshDeviceCards(); });
+
+        _deviceRefreshTimer = new System.Windows.Forms.Timer { Interval = 5000 };
+        _deviceRefreshTimer.Tick += (_, _) => { if (!IsDisposed && _pnlHomeView.Visible) RefreshDeviceCards(); };
+        _deviceRefreshTimer.Start();
 
         try
         {
@@ -223,6 +232,22 @@ internal sealed class MainForm : Form, IHostUi
         {
             MessageBox.Show(this, $"啟動被控服務失敗：{ex.Message}\n本機仍可作為控制端連線至其他電腦。", "服務提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
+
+        Task.Run(() =>
+        {
+            try
+            {
+                var wp = DesktopHelper.GetDesktopWallpaperBytes();
+                if (wp != null && wp.Length > 0)
+                {
+                    var thumbDir = Path.Combine(AppConfig.DataDirectory, "thumbnails");
+                    Directory.CreateDirectory(thumbDir);
+                    string selfThumb = Path.Combine(thumbDir, $"{_hostConfig.DeviceId}.jpg");
+                    File.WriteAllBytes(selfThumb, wp);
+                }
+            }
+            catch { }
+        });
 
         UpdateLocalNetworkInfo();
         RefreshDeviceCards();
@@ -1618,7 +1643,6 @@ internal sealed class MainForm : Form, IHostUi
     {
         ExitFullscreen();
         try { item.Session.SendDisconnect(); } catch { }
-        SaveThumbnail(item);
         item.ImeClient.Dispose();
         item.Session.Dispose();
 
@@ -1637,21 +1661,7 @@ internal sealed class MainForm : Form, IHostUi
 
     private void SaveThumbnail(SessionTabItem item)
     {
-        try
-        {
-            using var thumb = item.Session.Decoder.CreateThumbnail(216, 122);
-            if (thumb != null)
-            {
-                var dir = Path.Combine(AppConfig.DataDirectory, "thumbnails");
-                Directory.CreateDirectory(dir);
-                var safeId = !string.IsNullOrEmpty(item.Session.HostDeviceId) ? item.Session.HostDeviceId : item.Key.Replace(":", "_");
-                var path = Path.Combine(dir, $"{safeId}.jpg");
-                thumb.Save(path, ImageFormat.Jpeg);
-
-                _viewerConfig.UpdateThumbnail(item.Key, item.Session.HostDeviceId, path);
-            }
-        }
-        catch { }
+        // 依據需求 4：設備代表圖片改採用設備桌面，不儲存螢幕截圖
     }
 
     private void CopyMyId()
@@ -1704,16 +1714,60 @@ internal sealed class MainForm : Form, IHostUi
     {
         var recent = _viewerConfig.GetRecent();
         var favs = _viewerConfig.GetFavorites();
-        _tabsDevices.UpdateCounts(recent.Count, favs.Count);
+
+        var lanDiscovered = _discovery.Devices
+            .Where(d => !NetworkHelper.IsSelfTarget(d.Id, _hostConfig.DeviceId, _viewerConfig.ViewerId) &&
+                        !NetworkHelper.IsSelfTarget(d.Address.ToString(), _hostConfig.DeviceId, _viewerConfig.ViewerId) &&
+                        (DateTime.Now - d.LastSeen < TimeSpan.FromSeconds(30)))
+            .OrderByDescending(d => d.LastSeen)
+            .ToList();
+
+        _tabsDevices.UpdateCounts(recent.Count, favs.Count, lanDiscovered.Count);
 
         _pnlDevicesGrid.Controls.Clear();
-        var list = _tabsDevices.SelectedIndex == 0 ? recent : favs;
+
+        List<RecentEntry> list;
+        if (_tabsDevices.SelectedIndex == 0)
+        {
+            list = recent;
+        }
+        else if (_tabsDevices.SelectedIndex == 1)
+        {
+            list = favs;
+        }
+        else
+        {
+            list = lanDiscovered.Select(d =>
+            {
+                var existing = _viewerConfig.Recent.FirstOrDefault(r => r.DeviceId == d.Id || r.Key == d.Id);
+                string? thumbPath = existing?.ThumbnailPath;
+                if (string.IsNullOrEmpty(thumbPath) || !File.Exists(thumbPath))
+                {
+                    string candidate = Path.Combine(AppConfig.DataDirectory, "thumbnails", $"{d.Id}.jpg");
+                    if (File.Exists(candidate)) thumbPath = candidate;
+                }
+                return new RecentEntry
+                {
+                    Key = d.Id,
+                    DeviceId = d.Id,
+                    Name = !string.IsNullOrEmpty(d.Name) ? d.Name : (!string.IsNullOrEmpty(d.User) ? d.User : d.Id),
+                    LastAddress = d.Address.ToString(),
+                    Port = d.Port,
+                    LastUsed = d.LastSeen,
+                    IsFavorite = existing?.IsFavorite ?? false,
+                    ThumbnailPath = thumbPath
+                };
+            }).ToList();
+        }
 
         if (list.Count == 0)
         {
-            _lblDevicesEmpty.Text = _tabsDevices.SelectedIndex == 0
-                ? "No recent connections yet. Enter a Remote Device ID above to connect."
-                : "No favorite devices yet. Right-click any recent connection card to add to favorites.";
+            _lblDevicesEmpty.Text = _tabsDevices.SelectedIndex switch
+            {
+                0 => "尚無連線紀錄。請在上方輸入遠端設備 ID 或 IP 進行連線。",
+                1 => "尚無我的最愛設備。可在連線紀錄或區域網設備卡片上按右鍵加入我的最愛。",
+                _ => "區域網路內目前未發現其他 RemoteDesk 設備。\n請確認其他電腦已開啟 RemoteDesk 並連上同一網路。"
+            };
             _lblDevicesEmpty.Visible = true;
             _pnlDevicesGrid.Controls.Add(_lblDevicesEmpty);
             return;
@@ -1722,8 +1776,17 @@ internal sealed class MainForm : Form, IHostUi
         _lblDevicesEmpty.Visible = false;
         foreach (var entry in list)
         {
+            bool isOnline = _sessionTabs.Any(s => s.Key == entry.Key || (!string.IsNullOrEmpty(entry.DeviceId) && s.Session.HostDeviceId == entry.DeviceId))
+                || _discovery.Devices.Any(d =>
+                    ((!string.IsNullOrEmpty(entry.DeviceId) && d.Id == entry.DeviceId) ||
+                     d.Id == entry.Key ||
+                     d.Address.ToString() == entry.Key ||
+                     d.EndPoint.ToString() == entry.Key)
+                    && (DateTime.Now - d.LastSeen < TimeSpan.FromSeconds(25)));
+
             var card = new DeviceThumbnailCard(
                 entry,
+                isOnline,
                 id => DoConnect(id),
                 key =>
                 {
@@ -1737,7 +1800,7 @@ internal sealed class MainForm : Form, IHostUi
                 },
                 (key, newName) =>
                 {
-                    var item = _viewerConfig.Recent.FirstOrDefault(x => x.Key == key);
+                    var item = _viewerConfig.Recent.FirstOrDefault(x => x.Key == key || x.DeviceId == key);
                     if (item != null)
                     {
                         item.Name = string.IsNullOrWhiteSpace(newName) ? null : newName.Trim();
@@ -1759,9 +1822,9 @@ internal sealed class MainForm : Form, IHostUi
             return;
         }
 
-        if (clean == _hostConfig.DeviceId)
+        if (NetworkHelper.IsSelfTarget(clean, _hostConfig.DeviceId, _viewerConfig.ViewerId))
         {
-            MessageBox.Show(this, "不能連線到本機自己的 ID！", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show(this, "禁止連線到本機自己的 IP 或 ID！", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
 
@@ -1789,11 +1852,18 @@ internal sealed class MainForm : Form, IHostUi
             while (true)
             {
                 session?.Dispose();
-                session = new ViewerSession(clean, _viewerConfig, _discovery);
+                session = new ViewerSession(clean, _viewerConfig, _discovery, _hostConfig.DeviceId);
 
                 try
                 {
                     await session.ConnectAsync(pwd, token, forceInteractive).ConfigureAwait(true);
+                    if (session.HostDeviceId == _hostConfig.DeviceId || session.HostDeviceId == _viewerConfig.ViewerId)
+                    {
+                        session.Dispose();
+                        StopConnectingAnimation();
+                        MessageBox.Show(this, "禁止連線到本機自己的 IP 或 ID！", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return;
+                    }
                     break; // 身份驗證通過，連線建立完成
                 }
                 catch (UnauthorizedAccessException ex)
@@ -1899,12 +1969,6 @@ internal sealed class MainForm : Form, IHostUi
                 {
                     canvas.RecalculateLayout();
                     canvas.Invalidate();
-
-                    if (seq >= 2 && !tabItem.ThumbnailSaved)
-                    {
-                        tabItem.ThumbnailSaved = true;
-                        SaveThumbnail(tabItem);
-                    }
                 });
             };
 
@@ -1947,6 +2011,22 @@ internal sealed class MainForm : Form, IHostUi
                 {
                     BeginInvoke(() => UpdateSessionMetrics(tabItem));
                 }
+            };
+
+            session.WallpaperReceived += bytes =>
+            {
+                try
+                {
+                    var thumbDir = Path.Combine(AppConfig.DataDirectory, "thumbnails");
+                    Directory.CreateDirectory(thumbDir);
+                    string hostId = !string.IsNullOrEmpty(session.HostDeviceId) ? session.HostDeviceId : clean;
+                    string safeKey = hostId.Replace(":", "_").Replace("/", "_").Replace("\\", "_");
+                    string thumbPath = Path.Combine(thumbDir, $"{safeKey}.jpg");
+                    File.WriteAllBytes(thumbPath, bytes);
+                    _viewerConfig.UpdateThumbnail(clean, session.HostDeviceId, thumbPath);
+                    BeginInvoke(() => { if (!IsDisposed) RefreshDeviceCards(); });
+                }
+                catch { }
             };
 
             session.Disconnected += reason => BeginInvoke(() =>
@@ -2012,14 +2092,22 @@ internal sealed class MainForm : Form, IHostUi
 
             _pnlHeader.Visible = false;
             _pnlSessionToolbar.Visible = false;
+            _pnlIncomingBanner.Visible = false;
+            _pnlConnectingBanner.Visible = false;
 
             WindowState = FormWindowState.Normal;
             FormBorderStyle = FormBorderStyle.None;
             Bounds = Screen.FromControl(this).Bounds;
             _btnFullscreen.Text = "⛶";
-            _sessionToolTip.SetToolTip(_btnFullscreen, "離開全螢幕 (F11)");
+            _sessionToolTip.SetToolTip(_btnFullscreen, "離開全螢幕 (ESC / F11)");
             _isFullscreen = true;
-            _currentSession?.Canvas.RecalculateLayout();
+
+            if (_currentSession != null)
+            {
+                _currentSession.Canvas.FitToWindow = true;
+                _currentSession.Canvas.RecalculateLayout();
+                _currentSession.Canvas.Focus();
+            }
         }
         else
         {
@@ -2059,6 +2147,11 @@ internal sealed class MainForm : Form, IHostUi
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
     {
+        if (_isFullscreen && (keyData == Keys.Escape || keyData == Keys.F11))
+        {
+            ExitFullscreen();
+            return true;
+        }
         if (keyData == Keys.F11 && _currentSession != null)
         {
             ToggleFullscreen();
@@ -2170,6 +2263,10 @@ internal sealed class MainForm : Form, IHostUi
 
         _keyboardHook?.Dispose();
         _keyboardHook = null;
+
+        _deviceRefreshTimer?.Stop();
+        _deviceRefreshTimer?.Dispose();
+        _deviceRefreshTimer = null;
 
         _connectingTimer.Stop();
         _connectingTimer.Dispose();

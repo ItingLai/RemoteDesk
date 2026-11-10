@@ -84,7 +84,7 @@ public sealed class InstallerForm : Form
 
         var lblHeaderSub = new Label
         {
-            Text = "版本 1.0.0 · 高速內網遠端控制 · 繁體中文",
+            Text = "版本 1.0.1 · 高速內網遠端控制 · 繁體中文",
             Font = new Font("Segoe UI", 8.5f, FontStyle.Regular),
             ForeColor = TextSecondary,
             Location = new Point(73, 40),

@@ -318,6 +318,19 @@ internal sealed class HostSession : IDisposable
             DesktopHelper.SyncThreadDesktop();
             Send(MessageCodec.MonitorList(monitors, selection));
 
+            try
+            {
+                var wpBytes = DesktopHelper.GetDesktopWallpaperBytes();
+                if (wpBytes != null && wpBytes.Length > 0)
+                {
+                    Send(MessageCodec.Wallpaper(wpBytes));
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("讀取並傳送被控端桌布失敗: " + ex.Message);
+            }
+
             while (!_cts.IsCancellationRequested)
             {
                 long now = _clock.ElapsedMilliseconds;

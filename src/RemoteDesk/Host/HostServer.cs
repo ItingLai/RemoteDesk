@@ -127,6 +127,14 @@ internal sealed class HostServer : IDisposable
             channel = secChannel;
             cts.CancelAfter(TimeSpan.FromSeconds(60)); // 重設逾時給使用者確認
 
+            if (string.Equals(clientHello.ViewerId, _config.DeviceId, StringComparison.OrdinalIgnoreCase))
+            {
+                Log.Warn($"拒絕來自本機自己的連線請求 ({clientHello.ViewerId})");
+                await channel.SendAsync(new PacketWriter((byte)0xFF).Str("禁止連線到本機自己的 IP 或 ID！").ToArray(), cts.Token).ConfigureAwait(false);
+                channel.Dispose();
+                return;
+            }
+
             if (busy)
             {
                 Log.Warn($"主機忙碌中，拒絕來自 {clientHello.ViewerName} ({remoteEndpoint}) 的連線");

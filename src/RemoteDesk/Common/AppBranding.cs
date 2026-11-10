@@ -54,7 +54,9 @@ public static class AppBranding
                     Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "app.ico"),
                     Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "app.ico"),
                     Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "app.ico"),
-                    @"C:\Users\User\Desktop\研究專案\remote\src\RemoteDesk\app.ico"
+                    Path.Combine(AppConfig.DataDirectory, "app.ico"),
+                    @"C:\Users\User\Desktop\研究專案\RemoteDesk\src\RemoteDesk\app.ico",
+                    @"C:\Users\User\Desktop\研究專案\RemoteDesk\publish\app.ico"
                 };
 
                 foreach (var path in candidatePaths)
@@ -325,7 +327,37 @@ $notifier.Show($toast)
                         stream.CopyTo(fs);
                     }
                 }
-                catch { }
+                catch
+                {
+                    // 若執行檔目錄無法寫入 (例如 Program Files 或 dotnet 測試主機目錄)，導出至 DataDirectory
+                    icoPath = Path.Combine(AppConfig.DataDirectory, "app.ico");
+                    try
+                    {
+                        Directory.CreateDirectory(AppConfig.DataDirectory);
+                        if (!File.Exists(icoPath))
+                        {
+                            var asm = Assembly.GetExecutingAssembly();
+                            using var stream = asm.GetManifestResourceStream("RemoteDesk.app.ico");
+                            if (stream != null)
+                            {
+                                using var fs = File.Create(icoPath);
+                                stream.CopyTo(fs);
+                            }
+                        }
+                    }
+                    catch { }
+                }
+            }
+
+            if (!File.Exists(icoPath))
+            {
+                string fallbackPath = Path.Combine(AppConfig.DataDirectory, "app.ico");
+                if (File.Exists(fallbackPath)) icoPath = fallbackPath;
+                else
+                {
+                    string repoPath = @"C:\Users\User\Desktop\研究專案\RemoteDesk\publish\app.ico";
+                    if (File.Exists(repoPath)) icoPath = repoPath;
+                }
             }
 
             string iconLocation = File.Exists(icoPath) ? icoPath : exePath;

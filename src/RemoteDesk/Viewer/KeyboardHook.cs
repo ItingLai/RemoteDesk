@@ -16,12 +16,20 @@ internal sealed class KeyboardHook : IDisposable
     private Win32.LowLevelProc? _proc;
     private readonly Func<bool> _isViewerActive;
     private readonly Action<ushort, ushort, KeyFlags> _onKeyEvent;
+    private readonly Func<bool>? _isFullscreen;
+    private readonly Action? _onExitFullscreen;
     private bool _disposed;
 
-    public KeyboardHook(Func<bool> isViewerActive, Action<ushort, ushort, KeyFlags> onKeyEvent)
+    public KeyboardHook(
+        Func<bool> isViewerActive,
+        Action<ushort, ushort, KeyFlags> onKeyEvent,
+        Func<bool>? isFullscreen = null,
+        Action? onExitFullscreen = null)
     {
         _isViewerActive = isViewerActive;
         _onKeyEvent = onKeyEvent;
+        _isFullscreen = isFullscreen;
+        _onExitFullscreen = onExitFullscreen;
         Install();
     }
 
@@ -60,6 +68,16 @@ internal sealed class KeyboardHook : IDisposable
 
             ushort vk = (ushort)kbd.vkCode;
             ushort scan = (ushort)kbd.scanCode;
+
+            // 全螢幕狀態下按下 ESC 退出全螢幕，不轉發給遠端主機
+            if (vk == 0x1B && _isFullscreen?.Invoke() == true)
+            {
+                if (!isUp)
+                {
+                    _onExitFullscreen?.Invoke();
+                }
+                return (IntPtr)1; // 吞噬事件
+            }
 
             // 特殊系統鍵判斷：Windows 鍵、Alt+Tab、Alt+Esc 等
             bool isWinKey = vk == 0x5B || vk == 0x5C;

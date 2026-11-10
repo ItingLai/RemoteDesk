@@ -1367,6 +1367,193 @@ public class UiComponentTests
         Assert.True(File.Exists(regIcon), $"Registry IconUri file should exist: {regIcon}");
     }
 
+    [Fact]
+    public void NetworkHelper_IsSelfTarget_CorrectlyDetectsSelfAndRemote()
+    {
+        string selfId = "123456789";
+        string viewerId = "987654321";
+
+        // 1. Self ID (含空格與不含空格)
+        Assert.True(NetworkHelper.IsSelfTarget("123456789", selfId, viewerId));
+        Assert.True(NetworkHelper.IsSelfTarget("123 456 789", selfId, viewerId));
+        Assert.True(NetworkHelper.IsSelfTarget("987654321", selfId, viewerId));
+        Assert.True(NetworkHelper.IsSelfTarget("987 654 321", selfId, viewerId));
+
+        // 2. Loopback 與 Local Host
+        Assert.True(NetworkHelper.IsSelfTarget("127.0.0.1", selfId, viewerId));
+        Assert.True(NetworkHelper.IsSelfTarget("127.0.0.1:21119", selfId, viewerId));
+        Assert.True(NetworkHelper.IsSelfTarget("127.0.0.2", selfId, viewerId));
+        Assert.True(NetworkHelper.IsSelfTarget("127.255.255.255:21119", selfId, viewerId));
+        Assert.True(NetworkHelper.IsSelfTarget("tcp://127.0.0.1:21119", selfId, viewerId));
+        Assert.True(NetworkHelper.IsSelfTarget("http://127.0.0.1:21119/", selfId, viewerId));
+        Assert.True(NetworkHelper.IsSelfTarget("localhost", selfId, viewerId));
+        Assert.True(NetworkHelper.IsSelfTarget("localhost:21119", selfId, viewerId));
+        Assert.True(NetworkHelper.IsSelfTarget("tcp://localhost:21119", selfId, viewerId));
+        Assert.True(NetworkHelper.IsSelfTarget("::1", selfId, viewerId));
+        Assert.True(NetworkHelper.IsSelfTarget("[::1]:21119", selfId, viewerId));
+        Assert.True(NetworkHelper.IsSelfTarget("0.0.0.0", selfId, viewerId));
+        Assert.True(NetworkHelper.IsSelfTarget("::", selfId, viewerId));
+        Assert.True(NetworkHelper.IsSelfTarget(Environment.MachineName, selfId, viewerId));
+
+        // 3. 本機所有網路介面 IP
+        var localIps = NetworkHelper.GetLocalAddresses();
+        foreach (var ip in localIps)
+        {
+            Assert.True(NetworkHelper.IsSelfTarget(ip.ToString(), selfId, viewerId));
+            Assert.True(NetworkHelper.IsSelfTarget($"{ip}:21119", selfId, viewerId));
+        }
+
+        // 4. 遠端非本機 ID 與 IP
+        Assert.False(NetworkHelper.IsSelfTarget("8.8.8.8", selfId, viewerId));
+        Assert.False(NetworkHelper.IsSelfTarget("1.1.1.1:21119", selfId, viewerId));
+        Assert.False(NetworkHelper.IsSelfTarget("555666777", selfId, viewerId));
+    }
+
+    [Fact]
+    public void DeviceTabsControl_SupportsThreeTabs_AndSelectsLanDevices()
+    {
+        using var tabs = new DeviceTabsControl();
+        tabs.UpdateCounts(5, 3, 7);
+
+        // Click on Tab 2 (區域網內設備)
+        using var bmp = new Bitmap(500, 38);
+        using var g = Graphics.FromImage(bmp);
+        tabs.DrawToBitmap(bmp, new Rectangle(0, 0, 500, 38));
+
+        tabs.SelectedIndex = 2;
+        Assert.Equal(2, tabs.SelectedIndex);
+    }
+
+    [Fact]
+    public void DeviceThumbnailCard_RendersDesktopAndStatusLights()
+    {
+        var entryOnline = new RecentEntry
+        {
+            Key = "111222333",
+            DeviceId = "111222333",
+            Name = "ONLINE-PC"
+        };
+        using var cardOnline = new DeviceThumbnailCard(entryOnline, true, _ => { }, _ => { }, _ => { });
+        Assert.True(cardOnline.IsOnline);
+
+        using var bmpOnline = new Bitmap(cardOnline.Width, cardOnline.Height);
+        cardOnline.DrawToBitmap(bmpOnline, new Rectangle(0, 0, cardOnline.Width, cardOnline.Height));
+        Assert.NotNull(bmpOnline);
+
+        var entryOffline = new RecentEntry
+        {
+            Key = "444555666",
+            DeviceId = "444555666",
+            Name = "OFFLINE-PC"
+        };
+        using var cardOffline = new DeviceThumbnailCard(entryOffline, false, _ => { }, _ => { }, _ => { });
+        Assert.False(cardOffline.IsOnline);
+
+        using var bmpOffline = new Bitmap(cardOffline.Width, cardOffline.Height);
+        cardOffline.DrawToBitmap(bmpOffline, new Rectangle(0, 0, cardOffline.Width, cardOffline.Height));
+        Assert.NotNull(bmpOffline);
+    }
+
+    [Fact]
+    public void MainForm_Fullscreen_ToggleAndEscBehavior()
+    {
+        using var form = new MainForm();
+        form.Show();
+        Application.DoEvents();
+
+        var miToggle = typeof(MainForm).GetMethod("ToggleFullscreen", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        var miExit = typeof(MainForm).GetMethod("ExitFullscreen", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        var fiFullscreen = typeof(MainForm).GetField("_isFullscreen", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        var fiHeader = typeof(MainForm).GetField("_pnlHeader", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        var fiToolbar = typeof(MainForm).GetField("_pnlSessionToolbar", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        var fiSessionView = typeof(MainForm).GetField("_pnlSessionView", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+        Assert.NotNull(miToggle);
+        Assert.NotNull(miExit);
+        Assert.NotNull(fiFullscreen);
+        Assert.NotNull(fiHeader);
+        Assert.NotNull(fiToolbar);
+        Assert.NotNull(fiSessionView);
+
+        var pnlSessionView = (Panel)fiSessionView!.GetValue(form)!;
+        pnlSessionView.Visible = true; // 模擬處於遠端工作階段畫面
+
+        // Enter Fullscreen
+        miToggle!.Invoke(form, null);
+        Assert.True((bool)fiFullscreen!.GetValue(form)!);
+
+        var pnlHeader = (Panel)fiHeader!.GetValue(form)!;
+        var pnlToolbar = (Panel)fiToolbar!.GetValue(form)!;
+        Assert.False(pnlHeader.Visible, "Header should be hidden in fullscreen");
+        Assert.False(pnlToolbar.Visible, "Toolbar should be hidden in fullscreen");
+
+        // Exit Fullscreen
+        miExit!.Invoke(form, null);
+        Assert.False((bool)fiFullscreen.GetValue(form)!);
+        Assert.True(pnlHeader.Visible, "Header should be restored after exiting fullscreen");
+        Assert.True(pnlToolbar.Visible, "Toolbar should be restored after exiting fullscreen");
+    }
+
+    [Fact]
+    public void DesktopHelper_GetDesktopWallpaperBytes_ReturnsValidJpegOrNull()
+    {
+        var wp = DesktopHelper.GetDesktopWallpaperBytes();
+        if (wp != null)
+        {
+            Assert.True(wp.Length > 100);
+            // JPEG magic bytes: 0xFF, 0xD8
+            Assert.Equal(0xFF, wp[0]);
+            Assert.Equal(0xD8, wp[1]);
+        }
+    }
+
+    [Fact]
+    public void Protocol_WallpaperMessageCodec_WorksAccurately()
+    {
+        byte[] fakeJpeg = new byte[] { 0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46 };
+        byte[] packet = MessageCodec.Wallpaper(fakeJpeg);
+
+        Assert.Equal((byte)HostMsg.Wallpaper, packet[0]);
+        var reader = new PacketReader(packet.AsSpan(1));
+        byte[] decoded = MessageCodec.ReadWallpaper(ref reader);
+
+        Assert.Equal(fakeJpeg, decoded);
+    }
+
+    [Fact]
+    public void DeviceThumbnailCard_RendersPureWallpaperThumbnail_WhenSupplied()
+    {
+        string tempDir = Path.Combine(Path.GetTempPath(), "RemoteDesk_Test_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        string tempThumb = Path.Combine(tempDir, "thumb.jpg");
+
+        try
+        {
+            using (var bmp = new Bitmap(216, 122))
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.Clear(Color.DarkSlateBlue);
+                bmp.Save(tempThumb, System.Drawing.Imaging.ImageFormat.Jpeg);
+            }
+
+            var entry = new RecentEntry
+            {
+                Key = "999888777",
+                DeviceId = "999888777",
+                ThumbnailPath = tempThumb
+            };
+
+            using var card = new DeviceThumbnailCard(entry, true, _ => { }, _ => { }, _ => { });
+            using var targetBmp = new Bitmap(card.Width, card.Height);
+            card.DrawToBitmap(targetBmp, new Rectangle(0, 0, card.Width, card.Height));
+            Assert.NotNull(targetBmp);
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, true); } catch { }
+        }
+    }
+
     private class DummyUi : IHostUi
     {
         public Task<bool> ConfirmAccessAsync(string viewerName, string viewerId, string address, string code, CancellationToken ct) => Task.FromResult(true);

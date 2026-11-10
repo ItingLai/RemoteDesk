@@ -38,7 +38,6 @@ internal sealed class ViewerForm : Form
     private int _frameCount;
     private long _lastFpsTime;
     private bool _clipboardUpdating;
-    private bool _thumbnailSaved;
 
     public ViewerForm(ViewerSession session)
     {
@@ -159,7 +158,9 @@ internal sealed class ViewerForm : Form
         // 6. 安裝鍵盤攔截器 (原生鍵盤傳遞)
         _keyboardHook = new KeyboardHook(
             () => Form.ActiveForm == this && _canvas.Focused,
-            (vk, scan, flags) => _session.SendKey(vk, scan, flags));
+            (vk, scan, flags) => _session.SendKey(vk, scan, flags),
+            () => _isFullscreen,
+            () => BeginInvoke(() => { if (_isFullscreen) ToggleFullscreen(); }));
 
         _lastFpsTime = Environment.TickCount64;
     }
@@ -312,37 +313,21 @@ internal sealed class ViewerForm : Form
         {
             _canvas.RecalculateLayout();
             _canvas.Invalidate();
-
-            if (seq >= 2 && !_thumbnailSaved)
-            {
-                _thumbnailSaved = true;
-                TrySaveThumbnail();
-            }
         });
     }
 
     private void TrySaveThumbnail()
     {
-        try
-        {
-            using var thumb = _session.Decoder.CreateThumbnail(280, 158);
-            if (thumb != null)
-            {
-                var dir = Path.Combine(AppConfig.DataDirectory, "thumbnails");
-                Directory.CreateDirectory(dir);
-                var safeId = !string.IsNullOrEmpty(_session.HostDeviceId) ? _session.HostDeviceId : _session.TargetIdOrHost.Replace(":", "_");
-                var path = Path.Combine(dir, $"{safeId}.jpg");
-                thumb.Save(path, System.Drawing.Imaging.ImageFormat.Jpeg);
-
-                var cfg = ViewerConfig.Load();
-                cfg.UpdateThumbnail(_session.TargetIdOrHost, _session.HostDeviceId, path);
-            }
-        }
-        catch { }
+        // 依據需求 4：設備代表圖片改採用設備桌面，不儲存螢幕截圖
     }
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
     {
+        if (_isFullscreen && (keyData == Keys.Escape || keyData == Keys.F11))
+        {
+            ToggleFullscreen();
+            return true;
+        }
         if (keyData == Keys.F11)
         {
             ToggleFullscreen();
@@ -359,21 +344,28 @@ internal sealed class ViewerForm : Form
             _prevBorderStyle = FormBorderStyle;
             _prevBounds = Bounds;
 
+            _toolbar.Visible = false;
+            _statusStrip.Visible = false;
+
             WindowState = FormWindowState.Normal;
             FormBorderStyle = FormBorderStyle.None;
             Bounds = Screen.FromControl(this).Bounds;
-            _btnFullscreen.Text = "視窗化 (F11)";
+            _btnFullscreen.Text = "視窗化 (ESC / F11)";
             _isFullscreen = true;
+            _canvas.RecalculateLayout();
+            _canvas.Focus();
         }
         else
         {
+            _toolbar.Visible = true;
+            _statusStrip.Visible = true;
             FormBorderStyle = _prevBorderStyle;
             WindowState = _prevWindowState;
             Bounds = _prevBounds;
             _btnFullscreen.Text = "全螢幕 (F11)";
             _isFullscreen = false;
+            _canvas.RecalculateLayout();
         }
-        _canvas.RecalculateLayout();
     }
 
     protected override void OnActivated(EventArgs e)

@@ -688,6 +688,11 @@ internal static unsafe class Win32
     [DllImport("user32.dll")]
     public static extern bool LockWorkStation();
 
+    public const uint SPI_GETDESKWALLPAPER = 0x0073;
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    public static extern int SystemParametersInfo(uint uAction, uint uParam, StringBuilder lpvParam, uint fuWinIni);
+
     [DllImport("kernel32.dll")]
     public static extern uint SetThreadExecutionState(uint esFlags);
 

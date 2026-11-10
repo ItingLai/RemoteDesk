@@ -196,6 +196,7 @@ internal sealed class LanDiscovery : IDisposable
             case "a":
             {
                 if (string.IsNullOrEmpty(p.Id) || p.Port <= 0) return;
+                if (p.Id == _selfId || (_advert != null && p.Id == _advert.Id)) return;
                 var dev = _devices.AddOrUpdate(p.Id,
                     _ => new DiscoveredDevice { Id = p.Id },
                     (_, d) => d);

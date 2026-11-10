@@ -68,12 +68,16 @@ internal sealed class ViewerSession : IDisposable
     public event Action<int, int, int>? CaretReceived;
     public event Action<string>? ClipboardReceived;
     public event Action<int>? RttUpdated;
+    public event Action<byte[]>? WallpaperReceived;
 
-    public ViewerSession(string targetIdOrHost, ViewerConfig config, LanDiscovery discovery)
+    private readonly string? _selfDeviceId;
+
+    public ViewerSession(string targetIdOrHost, ViewerConfig config, LanDiscovery discovery, string? selfDeviceId = null)
     {
         TargetIdOrHost = targetIdOrHost;
         _config = config;
         _discovery = discovery;
+        _selfDeviceId = selfDeviceId;
     }
 
     /// <summary>
@@ -86,6 +90,15 @@ internal sealed class ViewerSession : IDisposable
 
         IPEndPoint endpoint;
         string cleanTarget = TargetIdOrHost.Replace(" ", "").Trim();
+
+        if (!string.IsNullOrEmpty(_selfDeviceId) && NetworkHelper.IsSelfTarget(cleanTarget, _selfDeviceId, _config.ViewerId))
+        {
+            throw new InvalidOperationException("禁止連線到本機自己的 IP 或 ID！");
+        }
+        if (cleanTarget == _config.ViewerId || (!string.IsNullOrEmpty(_selfDeviceId) && cleanTarget == _selfDeviceId))
+        {
+            throw new InvalidOperationException("禁止連線到本機自己的 IP 或 ID！");
+        }
 
         // 判斷是否為 9 位數 ID
         if (cleanTarget.Length == 9 && cleanTarget.All(char.IsDigit))
@@ -118,6 +131,11 @@ internal sealed class ViewerSession : IDisposable
             endpoint = new IPEndPoint(ip, port);
         }
 
+        if (!string.IsNullOrEmpty(_selfDeviceId) && NetworkHelper.IsLocalAddress(endpoint.Address))
+        {
+            throw new InvalidOperationException("禁止連線到本機自己的 IP 或 ID！");
+        }
+
         var tcp = new TcpClient(AddressFamily.InterNetwork);
         _tcp = tcp;
         SecureChannel.TuneSocket(tcp.Client);
@@ -132,6 +150,13 @@ internal sealed class ViewerSession : IDisposable
         _channel = channel;
         HostDeviceId = hello.HostId;
         HostDeviceName = hello.HostName;
+
+        if (hello.HostId == _config.ViewerId || (!string.IsNullOrEmpty(_selfDeviceId) && hello.HostId == _selfDeviceId))
+        {
+            channel.Dispose();
+            tcp.Dispose();
+            throw new InvalidOperationException("禁止連線到本機自己的 IP 或 ID！");
+        }
 
         if (hello.Busy)
         {
@@ -274,6 +299,12 @@ internal sealed class ViewerSession : IDisposable
                     var cur = CreateCustomCursor(cw, ch, hx, hy, bgra);
                     CursorShapeChanged?.Invoke(cur);
                 }
+                break;
+            }
+            case HostMsg.Wallpaper:
+            {
+                var wp = MessageCodec.ReadWallpaper(ref r);
+                WallpaperReceived?.Invoke(wp);
                 break;
             }
             case HostMsg.ImeState:

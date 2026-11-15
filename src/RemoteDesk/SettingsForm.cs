@@ -7,7 +7,7 @@ using RemoteDesk.Net;
 namespace RemoteDesk;
 
 /// <summary>
-/// 左側分類導覽按鈕：純 GDI+ 向量繪製圖標與標題，100% 杜絕圖標為空、遺漏或字型缺失之問題。
+/// 左側分類導覽按鈕：純 GDI+ 向量繪製圖標與標題。
 /// </summary>
 internal sealed class CategoryNavButton : Control
 {
@@ -49,7 +49,7 @@ internal sealed class CategoryNavButton : Control
             g.FillRectangle(activeBar, 0, 0, 3, Height);
         }
 
-        // 3. 純 GDI+ 向量圖標 (100% 向量繪製，絕不因字型缺失而出現空白)
+        // 3. 純 GDI+ 向量圖標
         var iconBounds = new Rectangle(12, 11, 18, 18);
         Color iconClr = IsActive ? Theme.Accent : (_isHovered ? Theme.TextPrimary : Theme.TextSecondary);
         switch (CategoryKey)
@@ -85,14 +85,17 @@ internal sealed class CategoryNavButton : Control
 }
 
 /// <summary>
-/// 依據規格第 6 節：現代化設定介面 (Settings)。
-/// 採用左側分類導覽、右側設定內容配置，支援深淺色主題、安全性、顯示、音訊、網路與帳號設定。
+/// 現代化設定介面 (Settings)：
+/// 整合無帳號裝置身分識別、ECDSA 公私鑰指紋、本機可信裝置 (Trust Management) 與無人值守模式。
 /// </summary>
 internal sealed class SettingsForm : Form
 {
     private readonly HostConfig _hostConfig;
     private readonly ViewerConfig _viewerConfig;
     private readonly Action _onConfigChanged;
+    private readonly TrustStore _trustStore;
+    private readonly DeviceIdentity _identity;
+    private readonly bool _ownsIdentity;
 
     // 左側分類按鈕
     private readonly Panel _pnlSidebar;
@@ -107,14 +110,18 @@ internal sealed class SettingsForm : Form
     private readonly CheckBox _chkStartWithWindows;
     private readonly CheckBox _chkMinimizeToTray;
 
-    // 2. Security
-    private readonly TextBox _txtPassword;
-    private readonly TextBox _txtConfirm;
+    // 2. Security & Trust Management
+    private readonly CheckBox _chkUnattendedAccess;
+    private readonly CheckBox _chkAutoAcceptTrusted;
     private readonly CheckBox _chkAllowInteractive;
     private readonly CheckBox _chkAllowClipboard;
+    private readonly TextBox _txtPassword;
+    private readonly TextBox _txtConfirm;
+    private readonly ListView _lvTrustedDevices;
 
     // 3. Display
     private readonly ComboBox _cboDefaultQuality;
+    private readonly ComboBox _cboResolutionMode;
     private readonly ComboBox _cboDefaultIme;
     private readonly CheckBox _chkFitToWindow;
 
@@ -123,20 +130,33 @@ internal sealed class SettingsForm : Form
 
     // 5. Network
     private readonly Label _lblLocalIps;
+    private readonly TextBox _txtSignalingUrl;
 
-    // 6. Account
+    // 6. Account & Device Identity
     private readonly Label _lblDeviceId;
     private readonly Label _lblDeviceName;
+    private readonly Label _lblFingerprint;
 
-    public SettingsForm(HostConfig hostConfig, ViewerConfig viewerConfig, Action onConfigChanged)
+    public SettingsForm(HostConfig hostConfig, ViewerConfig viewerConfig, Action onConfigChanged, TrustStore? trustStore = null, DeviceIdentity? identity = null)
     {
         _hostConfig = hostConfig;
         _viewerConfig = viewerConfig;
         _onConfigChanged = onConfigChanged;
+        _trustStore = trustStore ?? new TrustStore();
+        if (identity != null)
+        {
+            _identity = identity;
+            _ownsIdentity = false;
+        }
+        else
+        {
+            _identity = DeviceIdentity.LoadOrCreate(AppConfig.SharedDirectory, hostConfig.DeviceId, hostConfig.DeviceName);
+            _ownsIdentity = true;
+        }
 
         Text = "RemoteDesk Settings";
-        Size = new Size(760, 560);
-        MinimumSize = new Size(680, 500);
+        Size = new Size(840, 640);
+        MinimumSize = new Size(760, 560);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
@@ -248,43 +268,232 @@ internal sealed class SettingsForm : Form
         _chkMinimizeToTray = CreateCheckBox("關閉時最小化至系統匣 (Minimize to Tray)", _viewerConfig.MinimizeToTray, 232);
         pnlGeneral.Controls.AddRange(new Control[] { _chkStartWithWindows, _chkMinimizeToTray });
 
-        // 2. Security Panel
-        var pnlSecurity = CreateContentPanel("Security Settings (安全性設定)");
+        // 2. Security Panel (Trust Management & Unattended Access)
+        var pnlSecurity = CreateContentPanel("Security & Trust Management (安全性與信任管理)");
         var lblSecNote = new Label
         {
-            Text = "設定無人值守密碼後，控制端可直接輸入密碼存取本機，無須手動同意。\n兩欄留空並儲存，將清除固定密碼並強制改回「互動確認連線」模式。",
+            Text = "RemoteDesk 採無帳號密碼的裝置公私鑰與信任授權機制。\n只有經過本機人工首次配對核准之「可信裝置」，才可在開啟無人值守時直接連入本機。",
             ForeColor = Theme.TextSecondary,
             Font = Theme.SmallFont,
-            Location = new Point(0, 42),
-            Size = new Size(500, 38)
+            Location = new Point(0, 40),
+            Size = new Size(580, 36)
         };
         pnlSecurity.Controls.Add(lblSecNote);
 
-        pnlSecurity.Controls.Add(CreateLabel("新密碼 (New Password)：", 96));
-        _txtPassword = CreatePasswordBox(120);
-        pnlSecurity.Controls.Add(_txtPassword);
+        _chkUnattendedAccess = CreateCheckBox("啟用無人值守存取模式 (Unattended Access - 預設關閉)", _hostConfig.UnattendedAccessEnabled, 84);
+        _chkAutoAcceptTrusted = CreateCheckBox("可信裝置自動接受 (Auto-accept trusted devices - 無須每次人工確認)", _hostConfig.AutoAcceptTrustedDevices, 114);
+        _chkAllowInteractive = CreateCheckBox("允許未授權裝置發起「互動授權請求」（畫面上跳窗核准）", _hostConfig.AllowInteractive, 144);
+        _chkAllowClipboard = CreateCheckBox("連線時允許雙向同步剪貼簿文字", _hostConfig.AllowClipboard, 174);
+        pnlSecurity.Controls.AddRange(new Control[] { _chkUnattendedAccess, _chkAutoAcceptTrusted, _chkAllowInteractive, _chkAllowClipboard });
 
-        pnlSecurity.Controls.Add(CreateLabel("確認密碼 (Confirm Password)：", 162));
-        _txtConfirm = CreatePasswordBox(186);
-        pnlSecurity.Controls.Add(_txtConfirm);
+        // 無人值守連線密碼區塊
+        var lblPwdSection = new Label
+        {
+            Text = "無人值守固定連線密碼 (Unattended Password - 選用)：",
+            Font = Theme.CreateFont(9.5f, FontStyle.Bold),
+            ForeColor = Theme.TextPrimary,
+            Location = new Point(0, 206),
+            AutoSize = true
+        };
+        var lblPwdStatus = new Label
+        {
+            Text = _hostConfig.HasPassword
+                ? "狀態：● 已設定固定連線密碼保護 (若不需變更請留空)"
+                : "狀態：○ 未設定密碼 (僅允許手動核准或已配對可信裝置)",
+            ForeColor = _hostConfig.HasPassword ? Theme.Success : Theme.TextSecondary,
+            Font = Theme.SmallFont,
+            Location = new Point(0, 228),
+            AutoSize = true
+        };
 
-        _chkAllowInteractive = CreateCheckBox("允許無密碼時發起「互動授權連線」（畫面上跳窗核准）", _hostConfig.AllowInteractive, 230);
-        _chkAllowClipboard = CreateCheckBox("連線時允許雙向同步剪貼簿文字", _hostConfig.AllowClipboard, 264);
-        pnlSecurity.Controls.AddRange(new Control[] { _chkAllowInteractive, _chkAllowClipboard });
+        var lblPwd = new Label
+        {
+            Text = "設定密碼：",
+            ForeColor = Theme.TextSecondary,
+            Font = Theme.SmallFont,
+            Location = new Point(0, 252),
+            AutoSize = true
+        };
+        _txtPassword = CreatePasswordBox(0, 274, 200);
+
+        var lblConfirm = new Label
+        {
+            Text = "確認密碼：",
+            ForeColor = Theme.TextSecondary,
+            Font = Theme.SmallFont,
+            Location = new Point(215, 252),
+            AutoSize = true
+        };
+        _txtConfirm = CreatePasswordBox(215, 274, 200);
+
+        var btnClearPassword = new Button
+        {
+            Text = "🗑️ 清除密碼",
+            Location = new Point(430, 273),
+            Size = new Size(110, 30),
+            BackColor = Theme.SurfaceElevated,
+            ForeColor = Theme.Danger,
+            FlatStyle = FlatStyle.Flat,
+            Font = Theme.SmallFont,
+            Cursor = Cursors.Hand,
+            Enabled = _hostConfig.HasPassword
+        };
+        btnClearPassword.FlatAppearance.BorderColor = Theme.Border;
+        btnClearPassword.Click += (_, _) =>
+        {
+            if (MessageBox.Show(this, "確定要清除無人值守連線密碼嗎？清除後未加入可信清單的控制端將無法透過密碼連入。", "清除密碼確認", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+            {
+                _hostConfig.SetPassword(null);
+                _hostConfig.TrySave();
+                _txtPassword.Clear();
+                _txtConfirm.Clear();
+                lblPwdStatus.Text = "狀態：○ 未設定密碼 (僅允許手動核准或已配對可信裝置)";
+                lblPwdStatus.ForeColor = Theme.TextSecondary;
+                btnClearPassword.Enabled = false;
+                MessageBox.Show(this, "連線密碼已成功清除！", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+        };
+
+        var lblPwdTip = new Label
+        {
+            Text = "※ 設定密碼後，未加入可信裝置清單的控制端可輸入此密碼登入；控制端連線時可勾選「記住密碼」。",
+            ForeColor = Theme.TextSecondary,
+            Font = Theme.SmallFont,
+            Location = new Point(0, 312),
+            Size = new Size(580, 24)
+        };
+
+        pnlSecurity.Controls.AddRange(new Control[]
+        {
+            lblPwdSection, lblPwdStatus, lblPwd, _txtPassword,
+            lblConfirm, _txtConfirm, btnClearPassword, lblPwdTip
+        });
+
+        var lblTrustList = new Label
+        {
+            Text = "已授權可信裝置清單 (Trusted Devices Management)：",
+            Font = Theme.CreateFont(9.5f, FontStyle.Bold),
+            ForeColor = Theme.TextPrimary,
+            Location = new Point(0, 344),
+            AutoSize = true
+        };
+        pnlSecurity.Controls.Add(lblTrustList);
+
+        _lvTrustedDevices = new ListView
+        {
+            Location = new Point(0, 370),
+            Size = new Size(580, 150),
+            View = View.Details,
+            FullRowSelect = true,
+            MultiSelect = false,
+            BackColor = Theme.Surface,
+            ForeColor = Theme.TextPrimary,
+            BorderStyle = BorderStyle.FixedSingle,
+            Font = Theme.SmallFont
+        };
+        _lvTrustedDevices.Columns.Add("裝置 ID", 90);
+        _lvTrustedDevices.Columns.Add("裝置名稱", 110);
+        _lvTrustedDevices.Columns.Add("公鑰指紋", 160);
+        _lvTrustedDevices.Columns.Add("配對時間", 90);
+        _lvTrustedDevices.Columns.Add("狀態", 60);
+        pnlSecurity.Controls.Add(_lvTrustedDevices);
+
+        var pnlTrustBtns = new FlowLayoutPanel
+        {
+            Location = new Point(0, 528),
+            Size = new Size(580, 36),
+            FlowDirection = FlowDirection.LeftToRight
+        };
+
+        var btnRevokeDevice = new Button
+        {
+            Text = "🚫 撤銷信任",
+            Size = new Size(110, 30),
+            BackColor = Theme.SurfaceElevated,
+            ForeColor = Theme.Warning,
+            FlatStyle = FlatStyle.Flat,
+            Font = Theme.SmallFont,
+            Cursor = Cursors.Hand
+        };
+        btnRevokeDevice.FlatAppearance.BorderColor = Theme.Border;
+        btnRevokeDevice.Click += (_, _) =>
+        {
+            if (_lvTrustedDevices.SelectedItems.Count > 0)
+            {
+                string id = _lvTrustedDevices.SelectedItems[0].Text;
+                _trustStore.RevokeDevice(id);
+                RefreshTrustedDevicesList();
+            }
+        };
+
+        var btnRemoveDevice = new Button
+        {
+            Text = "🗑️ 移除裝置",
+            Size = new Size(110, 30),
+            BackColor = Theme.SurfaceElevated,
+            ForeColor = Theme.Danger,
+            FlatStyle = FlatStyle.Flat,
+            Font = Theme.SmallFont,
+            Cursor = Cursors.Hand
+        };
+        btnRemoveDevice.FlatAppearance.BorderColor = Theme.Border;
+        btnRemoveDevice.Click += (_, _) =>
+        {
+            if (_lvTrustedDevices.SelectedItems.Count > 0)
+            {
+                string id = _lvTrustedDevices.SelectedItems[0].Text;
+                _trustStore.RemoveDevice(id);
+                RefreshTrustedDevicesList();
+            }
+        };
+
+        var btnRevokeAll = new Button
+        {
+            Text = "⚠️ 撤銷所有可信裝置",
+            Size = new Size(160, 30),
+            BackColor = Theme.SurfaceElevated,
+            ForeColor = Theme.Danger,
+            FlatStyle = FlatStyle.Flat,
+            Font = Theme.SmallFont,
+            Cursor = Cursors.Hand
+        };
+        btnRevokeAll.FlatAppearance.BorderColor = Theme.Border;
+        btnRevokeAll.Click += (_, _) =>
+        {
+            if (MessageBox.Show(this, "確定要撤銷所有已授權的可信裝置嗎？撤銷後所有裝置均需重新手動確認。", "撤銷確認", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+            {
+                _trustStore.RevokeAll();
+                RefreshTrustedDevicesList();
+            }
+        };
+
+        pnlTrustBtns.Controls.AddRange(new Control[] { btnRevokeDevice, btnRemoveDevice, btnRevokeAll });
+        pnlSecurity.Controls.Add(pnlTrustBtns);
+
+        RefreshTrustedDevicesList();
 
         // 3. Display Panel
         var pnlDisplay = CreateContentPanel("Display Settings (顯示與輸入設定)");
-        pnlDisplay.Controls.Add(CreateLabel("Default Quality 預設遠端畫質：", 44));
-        _cboDefaultQuality = CreateComboBox(new[] { "極速流暢 (50% 畫質 - 網路頻寬有限時)", "平衡推薦 (70% 畫質 - 推薦標準)", "極致超清 (90% 畫質 - 內網無損細節)" },
+        pnlDisplay.Controls.Add(CreateLabel("Default Quality 預設遠端畫質 (與解析度獨立)：", 44));
+        _cboDefaultQuality = CreateComboBox(new[] { "低負載壓縮 (50% 畫質 - 保持設定解析度)", "平衡推薦 (70% 畫質 - 推薦標準)", "極致超清 (90% 畫質 - 內網無損細節)" },
             _viewerConfig.Quality <= 55 ? 0 : (_viewerConfig.Quality <= 75 ? 1 : 2), 70);
         pnlDisplay.Controls.Add(_cboDefaultQuality);
 
-        pnlDisplay.Controls.Add(CreateLabel("Input Method 輸入法連線預設：", 120));
+        pnlDisplay.Controls.Add(CreateLabel("Resolution Mode 解析度自適應控制模式：", 114));
+        _cboResolutionMode = CreateComboBox(new[]
+        {
+            "Auto 自動模式 (原生解析度優先，僅壅塞時漸進降採樣)",
+            "Original 原生鎖定 (強制維持原始解析度，壅塞時警示)",
+            "Performance 流暢優先 (操作順暢優先，較積極適應頻寬)"
+        }, Math.Clamp((int)_viewerConfig.ResolutionMode, 0, 2), 140);
+        pnlDisplay.Controls.Add(_cboResolutionMode);
+
+        pnlDisplay.Controls.Add(CreateLabel("Input Method 輸入法連線預設：", 186));
         _cboDefaultIme = CreateComboBox(new[] { "雙向鎖定綁定 (推薦 - 中英同步一致)", "本機獨立組字 (傳統模式)" },
-            _viewerConfig.ImeMode == ImeSyncMode.Bound ? 0 : 1, 146);
+            _viewerConfig.ImeMode == ImeSyncMode.Bound ? 0 : 1, 212);
         pnlDisplay.Controls.Add(_cboDefaultIme);
 
-        _chkFitToWindow = CreateCheckBox("預設自動縮放畫面以符合視窗大小 (Fit to Window)", _viewerConfig.FitToWindow, 198);
+        _chkFitToWindow = CreateCheckBox("預設自動縮放畫面以符合視窗大小 (Fit to Window)", _viewerConfig.FitToWindow, 262);
         pnlDisplay.Controls.Add(_chkFitToWindow);
 
         // 4. Audio Panel
@@ -298,7 +507,7 @@ internal sealed class SettingsForm : Form
             AutoSize = true
         };
         _chkAudioEnabled = CreateCheckBox("啟用遠端電腦音訊同步播放 (實驗性)", false, 76);
-        _chkAudioEnabled.Enabled = false; // 依規格 11/15 明確標註為 Disabled
+        _chkAudioEnabled.Enabled = false;
         pnlAudio.Controls.AddRange(new Control[] { lblAudioBadge, _chkAudioEnabled });
 
         // 5. Network Panel
@@ -334,11 +543,32 @@ internal sealed class SettingsForm : Form
         };
         pnlNetwork.Controls.AddRange(new Control[] { _lblLocalIps, btnCopyIps });
 
-        // 6. Account Panel
-        var pnlAccount = CreateContentPanel("Account & Device Info (帳號與設備資訊)");
+        pnlNetwork.Controls.Add(CreateLabel("中央協調伺服器網址 (Signaling Server URL)：", 230));
+        _txtSignalingUrl = new TextBox
+        {
+            Location = new Point(0, 256),
+            Size = new Size(420, Theme.InputHeight),
+            Text = _hostConfig.SignalingServerUrl,
+            BackColor = Theme.Surface,
+            ForeColor = Theme.TextPrimary,
+            BorderStyle = BorderStyle.FixedSingle,
+            Font = Theme.BodyFont
+        };
+        var lblSignalingHint = new Label
+        {
+            Text = "預設伺服器：https://signal.remotedesk.ink\n留空表示純內網原生模式 (LAN Native Mode，使用 UDP 廣播探索)。",
+            Location = new Point(0, 292),
+            Size = new Size(500, 36),
+            ForeColor = Theme.TextSecondary,
+            Font = Theme.SmallFont
+        };
+        pnlNetwork.Controls.AddRange(new Control[] { _txtSignalingUrl, lblSignalingHint });
+
+        // 6. Account Panel (Device Identity & Credentials)
+        var pnlAccount = CreateContentPanel("Account & Device Identity (裝置身分與金鑰)");
         _lblDeviceId = new Label
         {
-            Text = $"本機 Device ID: {AppConfig.FormatId(_hostConfig.DeviceId)}",
+            Text = $"本機 Device ID: {AppConfig.FormatId(_identity.DeviceId)}",
             Font = Theme.CreateMonoFont(11f, FontStyle.Bold),
             ForeColor = Theme.Accent,
             Location = new Point(0, 44),
@@ -346,21 +576,55 @@ internal sealed class SettingsForm : Form
         };
         _lblDeviceName = new Label
         {
-            Text = $"電腦名稱 (Device Name): {_hostConfig.DeviceName}",
+            Text = $"電腦名稱 (Device Name): {_identity.DeviceName}",
             Font = Theme.BodyFont,
             ForeColor = Theme.TextPrimary,
-            Location = new Point(0, 80),
+            Location = new Point(0, 78),
             AutoSize = true
         };
+        _lblFingerprint = new Label
+        {
+            Text = $"ECDSA 公鑰指紋:\n{_identity.PublicKeyFingerprint}",
+            Font = Theme.CreateMonoFont(9f),
+            ForeColor = Theme.TextSecondary,
+            Location = new Point(0, 110),
+            Size = new Size(580, 44)
+        };
+
+        var btnRegenerate = new Button
+        {
+            Text = "🔄 重新產生裝置身分 (Regenerate Identity)",
+            Location = new Point(0, 168),
+            Size = new Size(260, 34),
+            BackColor = Theme.SurfaceElevated,
+            ForeColor = Theme.Warning,
+            FlatStyle = FlatStyle.Flat,
+            Font = Theme.BodyFont,
+            Cursor = Cursors.Hand
+        };
+        btnRegenerate.FlatAppearance.BorderColor = Theme.Border;
+        btnRegenerate.Click += (_, _) =>
+        {
+            if (MessageBox.Show(this, "重新產生裝置身分將更換本機 ECDSA 金鑰對。\n先前已將本機加入信任的其他電腦將會要求重新配對確認，是否確定重新產生？", "身分重新產生確認", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+            {
+                _identity.Regenerate(AppConfig.SharedDirectory);
+                _hostConfig.DeviceId = _identity.DeviceId;
+                _hostConfig.TrySave();
+                _lblDeviceId.Text = $"本機 Device ID: {AppConfig.FormatId(_identity.DeviceId)}";
+                _lblFingerprint.Text = $"ECDSA 公鑰指紋:\n{_identity.PublicKeyFingerprint}";
+                MessageBox.Show(this, "裝置身分金鑰已成功重新產生！", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+        };
+
         var lblAccountMode = new Label
         {
-            Text = "連線模式：內網原生專用 (LAN Native Mode - 不需要固定外部 IP)\n安全協定：ECDH P-256 金鑰交換 + AES-256-GCM 傳輸加密",
+            Text = "身分架構：Device ID + ECDSA P-256 公私鑰 + Windows DPAPI 安全保護 (無帳號密碼)\n安全傳輸協定：ECDH P-256 臨時密鑰協商 + HKDF + AES-256-GCM 端對端認證加密",
             Font = Theme.SmallFont,
             ForeColor = Theme.TextSecondary,
-            Location = new Point(0, 120),
-            Size = new Size(500, 44)
+            Location = new Point(0, 220),
+            Size = new Size(580, 44)
         };
-        pnlAccount.Controls.AddRange(new Control[] { _lblDeviceId, _lblDeviceName, lblAccountMode });
+        pnlAccount.Controls.AddRange(new Control[] { _lblDeviceId, _lblDeviceName, _lblFingerprint, btnRegenerate, lblAccountMode });
 
         // 註冊分類面板
         _categoryPanels["General"] = pnlGeneral;
@@ -370,28 +634,43 @@ internal sealed class SettingsForm : Form
         _categoryPanels["Network"] = pnlNetwork;
         _categoryPanels["Account"] = pnlAccount;
 
-        // 建立左側分類按鈕 (帶有純 GDI+ 向量圖標)
-        AddCategoryButton("General", "一般設定");
-        AddCategoryButton("Security", "安全性");
-        AddCategoryButton("Display", "顯示與輸入");
-        AddCategoryButton("Audio", "音訊");
-        AddCategoryButton("Network", "網路");
-        AddCategoryButton("Account", "帳號與設備");
-
-        // 預設切換至 General
-        SelectCategory("General");
+        // 建立左側導覽按鈕
+        AddNavButton("General", "一般設定");
+        AddNavButton("Security", "安全性與信任");
+        AddNavButton("Display", "顯示與輸入");
+        AddNavButton("Audio", "音訊設定");
+        AddNavButton("Network", "網路與連接埠");
+        AddNavButton("Account", "裝置身分金鑰");
 
         Controls.Add(_pnlContent);
         Controls.Add(_pnlSidebar);
         Controls.Add(pnlBottom);
         Controls.Add(pnlHeader);
+
+        // 預設選中 General
+        SelectCategory("General");
     }
 
-    private void AddCategoryButton(string key, string title)
+    private void RefreshTrustedDevicesList()
+    {
+        _lvTrustedDevices.Items.Clear();
+        foreach (var dev in _trustStore.GetAll())
+        {
+            var item = new ListViewItem(dev.TrustedDeviceId);
+            item.SubItems.Add(dev.TrustedDeviceName);
+            item.SubItems.Add(dev.TrustedPublicKeyFingerprint.Length > 20 ? dev.TrustedPublicKeyFingerprint[..20] + "..." : dev.TrustedPublicKeyFingerprint);
+            item.SubItems.Add(dev.PairedAt.ToLocalTime().ToString("yyyy/MM/dd"));
+            item.SubItems.Add(dev.TrustStatus.ToString());
+            _lvTrustedDevices.Items.Add(item);
+        }
+    }
+
+    private void AddNavButton(string key, string title)
     {
         var btn = new CategoryNavButton(key, title)
         {
-            Location = new Point(8, 12 + _categoryButtons.Count * 44)
+            Location = new Point(8, 12 + _categoryButtons.Count * 46),
+            Width = _pnlSidebar.Width - 16
         };
         btn.Click += (_, _) => SelectCategory(key);
         _categoryButtons.Add(btn);
@@ -402,26 +681,29 @@ internal sealed class SettingsForm : Form
     {
         foreach (var btn in _categoryButtons)
         {
-            btn.IsActive = (btn.CategoryKey == key);
+            btn.IsActive = btn.CategoryKey == key;
             btn.Invalidate();
         }
 
+        _pnlContent.SuspendLayout();
         _pnlContent.Controls.Clear();
-        if (_categoryPanels.TryGetValue(key, out var panel))
+        if (_categoryPanels.TryGetValue(key, out var pnl))
         {
-            _pnlContent.Controls.Add(panel);
+            pnl.Dock = DockStyle.Fill;
+            _pnlContent.Controls.Add(pnl);
         }
+        _pnlContent.ResumeLayout();
     }
 
     private static Panel CreateContentPanel(string title)
     {
-        var pnl = new Panel { Dock = DockStyle.Fill, AutoScroll = true };
+        var pnl = new Panel { AutoScroll = true, BackColor = Theme.Background };
         var lbl = new Label
         {
             Text = title,
-            Font = Theme.SectionTitleFont,
+            Font = Theme.CreateFont(12f, FontStyle.Bold),
             ForeColor = Theme.TextPrimary,
-            Location = new Point(0, 0),
+            Location = new Point(0, 4),
             AutoSize = true
         };
         pnl.Controls.Add(lbl);
@@ -442,30 +724,18 @@ internal sealed class SettingsForm : Form
     {
         var cbo = new ComboBox
         {
-            Location = new Point(0, top),
-            Size = new Size(320, 32),
             DropDownStyle = ComboBoxStyle.DropDownList,
+            Location = new Point(0, top),
+            Size = new Size(340, Theme.InputHeight),
             BackColor = Theme.Surface,
             ForeColor = Theme.TextPrimary,
-            FlatStyle = FlatStyle.Flat,
-            Font = Theme.BodyFont
+            Font = Theme.BodyFont,
+            FlatStyle = FlatStyle.Flat
         };
         cbo.Items.AddRange(items);
         if (selectedIndex >= 0 && selectedIndex < items.Length) cbo.SelectedIndex = selectedIndex;
         return cbo;
     }
-
-    private static TextBox CreatePasswordBox(int top) =>
-        new()
-        {
-            Location = new Point(0, top),
-            Size = new Size(260, 28),
-            UseSystemPasswordChar = true,
-            BackColor = Theme.Surface,
-            ForeColor = Theme.TextPrimary,
-            BorderStyle = BorderStyle.FixedSingle,
-            Font = Theme.CreateFont(10.5f)
-        };
 
     private static CheckBox CreateCheckBox(string text, bool isChecked, int top) =>
         new()
@@ -478,25 +748,47 @@ internal sealed class SettingsForm : Form
             Font = Theme.BodyFont
         };
 
+    private static TextBox CreatePasswordBox(int left, int top, int width) =>
+        new()
+        {
+            UseSystemPasswordChar = true,
+            Location = new Point(left, top),
+            Size = new Size(width, Theme.InputHeight),
+            BackColor = Theme.Surface,
+            ForeColor = Theme.TextPrimary,
+            BorderStyle = BorderStyle.FixedSingle,
+            Font = Theme.BodyFont
+        };
+
     private void SaveSettings()
     {
-        // 1. 密碼檢查
+        // 密碼變更檢查
         if (!string.IsNullOrEmpty(_txtPassword.Text) || !string.IsNullOrEmpty(_txtConfirm.Text))
         {
             if (_txtPassword.Text != _txtConfirm.Text)
             {
-                MessageBox.Show(this, "兩次輸入的無人值守密碼不一致，請重新檢查！", "密碼錯誤", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show(this, "兩次輸入的連線密碼不一致，請重新確認！", "密碼錯誤", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            if (_txtPassword.Text.Length < 6)
+            {
+                MessageBox.Show(this, "連線密碼長度建議至少 6 個字元！", "密碼長度不足", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
             _hostConfig.SetPassword(_txtPassword.Text);
-        }
-        else if (string.IsNullOrEmpty(_txtPassword.Text) && string.IsNullOrEmpty(_txtConfirm.Text))
-        {
-            _hostConfig.SetPassword(null);
+            if (!_hostConfig.UnattendedAccessEnabled)
+            {
+                _hostConfig.UnattendedAccessEnabled = true;
+                _chkUnattendedAccess.Checked = true;
+            }
         }
 
+        // 1. 安全性設定更新
+        _hostConfig.UnattendedAccessEnabled = _chkUnattendedAccess.Checked;
+        _hostConfig.AutoAcceptTrustedDevices = _chkAutoAcceptTrusted.Checked;
         _hostConfig.AllowInteractive = _chkAllowInteractive.Checked;
         _hostConfig.AllowClipboard = _chkAllowClipboard.Checked;
+        _hostConfig.SignalingServerUrl = _txtSignalingUrl.Text.Trim();
         _hostConfig.TrySave();
 
         // 2. 檢視端設定
@@ -506,6 +798,7 @@ internal sealed class SettingsForm : Form
             1 => 70,
             _ => 90
         };
+        _viewerConfig.ResolutionMode = (ResolutionMode)Math.Clamp(_cboResolutionMode.SelectedIndex, 0, 2);
         _viewerConfig.ImeMode = _cboDefaultIme.SelectedIndex == 0 ? ImeSyncMode.Bound : ImeSyncMode.Local;
         _viewerConfig.FitToWindow = _chkFitToWindow.Checked;
         _viewerConfig.ThemeMode = _cboTheme.SelectedIndex switch
@@ -519,12 +812,18 @@ internal sealed class SettingsForm : Form
         _viewerConfig.MinimizeToTray = _chkMinimizeToTray.Checked;
         _viewerConfig.Save();
 
-        // 3. 設定 Windows 開機自動啟動註冊表 (實際生效)
+        // 3. 設定 Windows 開機自動啟動註冊表
         AppConfig.SetStartupWithWindows(_chkStartWithWindows.Checked);
 
         _onConfigChanged();
 
         MessageBox.Show(this, "所有設定已成功儲存！", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
         Close();
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        if (_ownsIdentity) _identity.Dispose();
+        base.OnFormClosed(e);
     }
 }

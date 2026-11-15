@@ -82,6 +82,36 @@ internal static class NetworkHelper
     }
 
     /// <summary>
+    /// 檢查目標 IP 是否與本機任何一個網路介面處於同一個子網路（或為 Loopback）。
+    /// </summary>
+    public static bool IsInSameSubnet(IPAddress targetIp)
+    {
+        if (IPAddress.IsLoopback(targetIp)) return true;
+        if (targetIp.AddressFamily != AddressFamily.InterNetwork) return false;
+
+        var targetBytes = targetIp.GetAddressBytes();
+        foreach (var (localIp, mask) in LanDiscovery.LocalIPv4())
+        {
+            if (localIp.AddressFamily != AddressFamily.InterNetwork || mask.AddressFamily != AddressFamily.InterNetwork) continue;
+            var localBytes = localIp.GetAddressBytes();
+            var maskBytes = mask.GetAddressBytes();
+            if (targetBytes.Length != 4 || localBytes.Length != 4 || maskBytes.Length != 4) continue;
+
+            bool match = true;
+            for (int i = 0; i < 4; i++)
+            {
+                if ((targetBytes[i] & maskBytes[i]) != (localBytes[i] & maskBytes[i]))
+                {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return true;
+        }
+        return false;
+    }
+
+    /// <summary>
     /// 判斷特定 IPAddress 是否代表本機地址（包含 127.0.0.0/8、::1、0.0.0.0、:: 以及所有 NIC IP）。
     /// </summary>
     public static bool IsLocalAddress(IPAddress? address)

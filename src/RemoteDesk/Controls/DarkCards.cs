@@ -495,6 +495,11 @@ internal sealed class DarkPasswordInput : Panel
 internal sealed class DeviceThumbnailCard : Panel
 {
     private readonly RecentEntry _entry;
+    private readonly string _renderedKey;
+    private readonly string? _renderedDeviceId;
+    private readonly string? _renderedName;
+    private readonly bool _renderedIsFavorite;
+    private readonly string? _renderedThumbnailPath;
     private readonly Action<string> _onConnect;
     private readonly Action<string> _onToggleFavorite;
     private readonly Action<string> _onRemove;
@@ -505,6 +510,15 @@ internal sealed class DeviceThumbnailCard : Panel
     private readonly ToolTip _statusToolTip = new() { InitialDelay = 150 };
     private const int Radius = Theme.CornerRadius; // 10px
 
+    public RecentEntry Entry => _entry;
+
+    internal bool MatchesRenderedState(RecentEntry entry) =>
+        string.Equals(_renderedKey, entry.Key, StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(_renderedDeviceId, entry.DeviceId, StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(_renderedName, entry.Name, StringComparison.Ordinal) &&
+        _renderedIsFavorite == entry.IsFavorite &&
+        string.Equals(_renderedThumbnailPath, entry.ThumbnailPath, StringComparison.OrdinalIgnoreCase);
+
     public bool IsOnline
     {
         get => _isOnline;
@@ -513,6 +527,11 @@ internal sealed class DeviceThumbnailCard : Panel
             if (_isOnline != value)
             {
                 _isOnline = value;
+                var currentTip = _statusToolTip.GetToolTip(this);
+                if (currentTip == "可連線 (就緒)" || currentTip == "設備離線")
+                {
+                    _statusToolTip.SetToolTip(this, _isOnline ? "可連線 (就緒)" : "設備離線");
+                }
                 Invalidate();
             }
         }
@@ -521,6 +540,11 @@ internal sealed class DeviceThumbnailCard : Panel
     public DeviceThumbnailCard(RecentEntry entry, bool isOnline, Action<string> onConnect, Action<string> onToggleFavorite, Action<string> onRemove, Action<string, string>? onRename = null)
     {
         _entry = entry;
+        _renderedKey = entry.Key;
+        _renderedDeviceId = entry.DeviceId;
+        _renderedName = entry.Name;
+        _renderedIsFavorite = entry.IsFavorite;
+        _renderedThumbnailPath = entry.ThumbnailPath;
         _isOnline = isOnline;
         _onConnect = onConnect;
         _onToggleFavorite = onToggleFavorite;

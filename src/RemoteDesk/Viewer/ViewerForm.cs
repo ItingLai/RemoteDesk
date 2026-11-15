@@ -20,6 +20,7 @@ internal sealed class ViewerForm : Form
     private readonly ToolStripDropDownButton _btnSpecialKeys;
     private readonly ToolStripButton _btnFitWindow;
     private readonly ToolStripDropDownButton _btnQuality;
+    private readonly ToolStripDropDownButton _btnResolutionMode;
     private readonly ToolStripButton _btnFullscreen;
     private readonly ToolStripButton _btnDisconnect;
 
@@ -38,10 +39,27 @@ internal sealed class ViewerForm : Form
     private int _frameCount;
     private long _lastFpsTime;
     private bool _clipboardUpdating;
+    private int _quality;
+    private int _fps;
+    private bool _lossless;
+
+    internal int SelectedQuality => _quality;
+    internal int SelectedMaxFps => _fps;
+    internal bool SelectedLossless => _lossless;
+    internal string QualityButtonText => _btnQuality.Text ?? "";
+    internal string ResolutionModeButtonText => _btnResolutionMode.Text ?? "";
+    internal string LatencyLabelText => _lblLatency.Text ?? "";
+    internal string FpsLabelText => _lblFps.Text ?? "";
+    internal string ResolutionLabelText => _lblResolution.Text ?? "";
+    internal ToolStripDropDownButton QualityDropDown => _btnQuality;
+    internal ToolStripDropDownButton ResolutionModeDropDown => _btnResolutionMode;
 
     public ViewerForm(ViewerSession session)
     {
         _session = session;
+        _quality = session.CurrentQuality;
+        _fps = session.CurrentMaxFps;
+        _lossless = session.CurrentLossless;
 
         Text = $"RemoteDesk - {session.HostDeviceName} ({AppConfig.FormatId(session.HostDeviceId)})";
         Size = new Size(1280, 800);
@@ -92,11 +110,17 @@ internal sealed class ViewerForm : Form
         _btnFitWindow = new ToolStripButton("視窗縮放") { Checked = true, CheckOnClick = true };
         _btnFitWindow.Click += (_, _) => _canvas.FitToWindow = _btnFitWindow.Checked;
 
-        // 畫質選項
-        _btnQuality = new ToolStripDropDownButton("畫質: 平衡 (70%)");
-        _btnQuality.DropDownItems.Add("極速流暢 (50% 畫質, 30 FPS)", null, (_, _) => SetQuality(50, 30, false, "極速流暢"));
-        _btnQuality.DropDownItems.Add("平衡推薦 (70% 畫質, 30 FPS, 無失真修補)", null, (_, _) => SetQuality(70, 30, true, "平衡"));
-        _btnQuality.DropDownItems.Add("極致超清 (90% 畫質, 60 FPS, 無失真修補)", null, (_, _) => SetQuality(90, 60, true, "極致超清"));
+        // 畫質選項（純控制 JPEG Quality，與解析度完全解耦；初值直接從 Session/設定同步）
+        _btnQuality = new ToolStripDropDownButton(FormatQualityButtonText(_quality));
+        _btnQuality.DropDownItems.Add("低負載壓縮 (50% 畫質, 30 FPS)", null, (_, _) => SetQuality(50, 30, false, "低負載 (50%)"));
+        _btnQuality.DropDownItems.Add("平衡推薦 (70% 畫質, 30 FPS, 無失真修補)", null, (_, _) => SetQuality(70, 30, true, "平衡 (70%)"));
+        _btnQuality.DropDownItems.Add("極致超清 (90% 畫質, 60 FPS, 無失真修補)", null, (_, _) => SetQuality(90, 60, true, "極致 (90%)"));
+
+        // 解析度自適應模式選項（與畫質獨立控制）
+        _btnResolutionMode = new ToolStripDropDownButton(FormatResolutionModeLabel(session.CurrentResolutionMode));
+        _btnResolutionMode.DropDownItems.Add("Auto 自動 (原生優先，僅壅塞降級)", null, (_, _) => SetResolutionMode(ResolutionMode.Auto));
+        _btnResolutionMode.DropDownItems.Add("Original 原生鎖定 (強制維持原始解析度)", null, (_, _) => SetResolutionMode(ResolutionMode.Original));
+        _btnResolutionMode.DropDownItems.Add("Performance 流暢優先 (積極確保操作順暢)", null, (_, _) => SetResolutionMode(ResolutionMode.Performance));
 
         // 全螢幕按鈕
         _btnFullscreen = new ToolStripButton("全螢幕 (F11)");
@@ -115,6 +139,7 @@ internal sealed class ViewerForm : Form
             _btnSpecialKeys,
             _btnFitWindow,
             _btnQuality,
+            _btnResolutionMode,
             _btnFullscreen,
             new ToolStripSeparator(),
             _btnDisconnect
@@ -124,8 +149,8 @@ internal sealed class ViewerForm : Form
         _statusStrip = new StatusStrip { BackColor = Color.FromArgb(32, 32, 32), ForeColor = Color.Silver };
         _lblHostInfo = new ToolStripStatusLabel($"主機: {session.HostDeviceName} ({session.HostDeviceId})");
         _lblResolution = new ToolStripStatusLabel("解析度: --");
-        _lblFps = new ToolStripStatusLabel("FPS: 0");
-        _lblLatency = new ToolStripStatusLabel("延遲: --");
+        _lblFps = new ToolStripStatusLabel(FormatFpsLabel(0, _fps, _quality));
+        _lblLatency = new ToolStripStatusLabel($"延遲: -- ({session.TransportTypeLabel})");
         _lblImeStatus = new ToolStripStatusLabel("輸入法狀態: 同步中");
         _statusStrip.Items.AddRange(new ToolStripItem[] { _lblHostInfo, _lblResolution, _lblFps, _lblLatency, _lblImeStatus });
 
@@ -141,15 +166,29 @@ internal sealed class ViewerForm : Form
 
         _imeClient.StateChanged += OnImeClientStateChanged;
 
-        // 5. 註冊 Session 事件
+        // 5. 註冊 Session 事件（統一經 SafeUiInvoke 防護處置與無 Handle 例外）
+        _session.ResolutionChanged += (w, h) => SafeUiInvoke(() =>
+        {
+            _canvas.RecalculateLayout();
+            _canvas.Invalidate();
+            UpdateResolutionStatusLabel();
+        });
+        _session.StreamConfigChanged += (origW, origH, streamW, streamH, level, mode, reason) => SafeUiInvoke(() =>
+        {
+            _btnResolutionMode.Text = FormatResolutionModeLabel(_session.CurrentResolutionMode);
+            UpdateResolutionStatusLabel();
+            _canvas.RecalculateLayout();
+            _canvas.Invalidate();
+        });
+        _session.TelemetryUpdated += t => SafeUiInvoke(() => UpdateStatusTelemetry(t));
         _session.FrameReceived += OnSessionFrameReceived;
         _session.MonitorsUpdated += OnSessionMonitorsUpdated;
-        _session.CursorShapeChanged += cur => BeginInvoke(() => _canvas.Cursor = cur ?? Cursors.Default);
+        _session.CursorShapeChanged += cur => SafeUiInvoke(() => _canvas.Cursor = cur ?? Cursors.Default);
         _session.ImeStateReceived += state => _imeClient.OnRemoteImeStateReceived(state);
         _session.CaretReceived += (x, y, h) => _imeClient.UpdateCaretPosition(x, y, h);
         _session.ClipboardReceived += OnSessionClipboardReceived;
-        _session.RttUpdated += ms => BeginInvoke(() => _lblLatency.Text = $"延遲: {ms} ms (區網直連)");
-        _session.Disconnected += reason => BeginInvoke(() =>
+        _session.RttUpdated += ms => SafeUiInvoke(() => UpdateLatencyFromRtt(ms));
+        _session.Disconnected += reason => SafeUiInvoke(() =>
         {
             MessageBox.Show(this, $"連線已結束: {reason}", "RemoteDesk", MessageBoxButtons.OK, MessageBoxIcon.Information);
             Close();
@@ -160,7 +199,7 @@ internal sealed class ViewerForm : Form
             () => Form.ActiveForm == this && _canvas.Focused,
             (vk, scan, flags) => _session.SendKey(vk, scan, flags),
             () => _isFullscreen,
-            () => BeginInvoke(() => { if (_isFullscreen) ToggleFullscreen(); }));
+            () => SafeUiInvoke(() => { if (_isFullscreen) ToggleFullscreen(); }));
 
         _lastFpsTime = Environment.TickCount64;
     }
@@ -203,10 +242,27 @@ internal sealed class ViewerForm : Form
         catch { }
     }
 
+    private void SafeUiInvoke(Action action)
+    {
+        if (IsDisposed || Disposing) return;
+        try
+        {
+            if (!InvokeRequired)
+            {
+                action();
+                return;
+            }
+            if (!IsHandleCreated) return;
+            BeginInvoke(action);
+        }
+        catch (ObjectDisposedException) { }
+        catch (InvalidOperationException) { }
+    }
+
     private void OnSessionClipboardReceived(string text)
     {
         if (string.IsNullOrEmpty(text)) return;
-        BeginInvoke(() =>
+        SafeUiInvoke(() =>
         {
             try
             {
@@ -221,10 +277,91 @@ internal sealed class ViewerForm : Form
         });
     }
 
+    internal static string FormatQualityButtonText(int quality) => quality switch
+    {
+        <= 55 => $"畫質: 低負載 ({quality}%)",
+        >= 85 => $"畫質: 極致 ({quality}%)",
+        _ => $"畫質: 平衡 ({quality}%)"
+    };
+
+    private static string FormatFpsLabel(float renderFps, int targetFps, int quality) =>
+        $"FPS: {renderFps:F0}/{targetFps} | 品質:{quality}%";
+
+    private static string FormatTelemetryLatencyLabel(HostStreamTelemetry t, string transportLabel, int? overrideRttMs = null)
+    {
+        double rtt = overrideRttMs ?? t.RttMs;
+        string warnTag = t.CongestionWarning ? " [原生壅塞警告]" : "";
+        return $"{transportLabel} | RTT:{rtt:F0}ms E2E:{t.EndToEndDelayMs:F0}ms Q:{t.SendQueueWaitMs:F0}ms{warnTag}";
+    }
+
     private void SetQuality(int quality, int fps, bool lossless, string label)
     {
-        _session.SendVideoSettings(quality, fps, lossless);
-        _btnQuality.Text = $"畫質: {label}";
+        _session.SendVideoSettings(quality, fps, lossless, _session.CurrentResolutionMode);
+        _quality = _session.CurrentQuality;
+        _fps = _session.CurrentMaxFps;
+        _lossless = _session.CurrentLossless;
+        _btnQuality.Text = FormatQualityButtonText(_quality);
+    }
+
+    private void SetResolutionMode(ResolutionMode mode)
+    {
+        // P1-01: 切換解析度模式只更新 ResolutionMode，完整保留現有 Quality / MaxFps / Lossless 設定
+        _session.SetResolutionMode(mode);
+        _quality = _session.CurrentQuality;
+        _fps = _session.CurrentMaxFps;
+        _lossless = _session.CurrentLossless;
+        _btnResolutionMode.Text = FormatResolutionModeLabel(_session.CurrentResolutionMode);
+    }
+
+    private static string FormatResolutionModeLabel(ResolutionMode mode) => mode switch
+    {
+        ResolutionMode.Original => "解析度: 原生鎖定",
+        ResolutionMode.Performance => "解析度: 流暢優先",
+        _ => "解析度: 自動"
+    };
+
+    private void UpdateResolutionStatusLabel()
+    {
+        int ow = _session.OriginalWidth > 0 ? _session.OriginalWidth : _session.RemoteWidth;
+        int oh = _session.OriginalHeight > 0 ? _session.OriginalHeight : _session.RemoteHeight;
+        int sw = _session.StreamWidth > 0 ? _session.StreamWidth : ow;
+        int sh = _session.StreamHeight > 0 ? _session.StreamHeight : oh;
+        int lvl = (int)_session.CurrentResolutionLevel;
+        _lblResolution.Text = (sw == ow && sh == oh)
+            ? $"解析度: {ow}x{oh} (原生 L0)"
+            : $"解析度: 原{ow}x{oh} / 串流{sw}x{sh} (L{lvl})";
+    }
+
+    private void UpdateLatencyFromRtt(int ms)
+    {
+        if (_session.CurrentTelemetry is { } t)
+        {
+            _lblLatency.Text = FormatTelemetryLatencyLabel(t, _session.TransportTypeLabel, overrideRttMs: ms);
+        }
+        else
+        {
+            _lblLatency.Text = $"延遲: {ms} ms ({_session.TransportTypeLabel})";
+        }
+    }
+
+    private void UpdateStatusTelemetry(HostStreamTelemetry t)
+    {
+        UpdateResolutionStatusLabel();
+        _btnResolutionMode.Text = FormatResolutionModeLabel(_session.CurrentResolutionMode);
+        _lblResolution.ForeColor = t.CongestionWarning ? Color.Orange : Color.Silver;
+        _lblFps.Text = FormatFpsLabel(t.ViewerRenderFps, t.TargetFps, _session.CurrentQuality);
+        _lblLatency.Text = FormatTelemetryLatencyLabel(t, _session.TransportTypeLabel);
+        string bwText = t.EstimatedBandwidthMbps > 0f ? $"{t.EstimatedBandwidthMbps:F2} Mbps" : (t.IsUdpTransport ? "樣本不足/閒置" : "N/A(TCP)");
+        string idleTag = t.IsStreamIdle ? " [靜態閒置]" : string.Empty;
+        _lblLatency.ToolTipText =
+            $"模式:{t.Mode} L{(int)t.Level} (Cfg v{t.ConfigVersion}) | 品質:{t.Quality}% (本機設定:{_session.CurrentQuality}%){idleTag} | 視窗:{t.TelemetryWindowMs}ms\n" +
+            $"原:{t.OriginalWidth}x{t.OriginalHeight} 串流:{t.StreamWidth}x{t.StreamHeight} | 管線上限:{t.EffectiveMaxInflightFrames}幀\n" +
+            $"FPS(Send/Render/Target): {t.ActualSendFps:F1}/{t.ViewerRenderFps:F1}/{t.TargetFps} Drops:{t.FrameDropCount}\n" +
+            $"Goodput/Wire/Avg/Peak: {t.GoodputMbps:F2}/{t.WireThroughputMbps:F2}/{t.AvgThroughputMbps:F2}/{t.PeakThroughputMbps:F2} Mbps EstBW:{bwText}\n" +
+            $"FrameAvg:{t.AverageFrameSizeBytes / 1024.0:F1}KB Enc/Dec/Ren: {t.AvgEncodeDurationMs:F1}/{t.AvgDecodeDurationMs:F1}/{t.AvgRenderDurationMs:F1}ms\n" +
+            $"E2E({t.EndToEndDelayStages}): {t.EndToEndDelayMs:F1}ms\n" +
+            $"Transport: {t.TransportSummary}\n" +
+            $"SwitchReason: {t.LastSwitchReason}";
     }
 
     private void OnImeModeToggleClick(object? sender, EventArgs e)
@@ -247,19 +384,16 @@ internal sealed class ViewerForm : Form
 
     private void OnImeClientStateChanged(ImeState state)
     {
-        if (InvokeRequired)
+        SafeUiInvoke(() =>
         {
-            BeginInvoke(new Action(() => OnImeClientStateChanged(state)));
-            return;
-        }
-
-        string modeDesc = state.IsNative ? "中文" : "英文";
-        _lblImeStatus.Text = $"輸入法綁定: {modeDesc} (配置: 0x{state.LangId:X4})";
+            string modeDesc = state.IsNative ? "中文" : "英文";
+            _lblImeStatus.Text = $"輸入法綁定: {modeDesc} (配置: 0x{state.LangId:X4})";
+        });
     }
 
     private void OnSessionMonitorsUpdated(List<MonitorInfo> monitors, string current)
     {
-        BeginInvoke(() =>
+        SafeUiInvoke(() =>
         {
             _cboMonitors.Items.Clear();
             int selectedIndex = 0;
@@ -302,18 +436,18 @@ internal sealed class ViewerForm : Form
             int fps = (int)(_frameCount * 1000.0f / (now - _lastFpsTime));
             _frameCount = 0;
             _lastFpsTime = now;
-            BeginInvoke(() =>
+            SafeUiInvoke(() =>
             {
-                _lblFps.Text = $"FPS: {fps}";
-                _lblResolution.Text = $"解析度: {_session.RemoteWidth}x{_session.RemoteHeight}";
+                int targetFps = _session.CurrentTelemetry?.TargetFps ?? _session.CurrentMaxFps;
+                _lblFps.Text = FormatFpsLabel(fps, targetFps, _session.CurrentQuality);
+                UpdateResolutionStatusLabel();
             });
         }
 
-        BeginInvoke(() =>
+        if (!dirtyRect.IsEmpty)
         {
-            _canvas.RecalculateLayout();
-            _canvas.Invalidate();
-        });
+            SafeUiInvoke(() => _canvas.InvalidateRemoteRect(dirtyRect));
+        }
     }
 
     private void TrySaveThumbnail()
@@ -395,6 +529,17 @@ internal sealed class ViewerForm : Form
         _imeClient.Dispose();
         _session.Dispose();
         base.OnFormClosing(e);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _keyboardHook?.Dispose();
+            _keyboardHook = null;
+            _imeClient.Dispose();
+        }
+        base.Dispose(disposing);
     }
 
     private sealed record MonitorItem(string DeviceName, string Title)

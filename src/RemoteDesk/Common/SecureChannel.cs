@@ -38,17 +38,77 @@ internal sealed class SecureChannel : IDisposable
     private ulong _sendCounter;
     private ulong _recvCounter;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly SemaphoreSlim _lowPriorityLock = new(1, 1);
+    private readonly bool _trackWriteWait;
+    private int _priorityWaiters;
+    private int _pendingLowPriority;
+    private readonly QueueWaitWindowTracker _queueWaitTracker = new();
+    private long _lastWriteDurationUs;
+    private readonly object _throughputLock = new();
+    private readonly long[] _bucketBytes = new long[8];
+    private readonly long[] _bucketSecondTicks = new long[8]; // 250ms tick index
     private readonly byte[] _lenBuf = new byte[4];
     private bool _disposed;
 
+    public Stream UnderlyingStream => _stream;
     public byte[] Transcript { get; }
     public string VerificationCode => Crypto.VerificationCode(Transcript);
     public long BytesSent;
     public long BytesReceived;
+    public int PendingLowPriorityCount => Volatile.Read(ref _pendingLowPriority);
+    public int HighPriorityWaiters => Volatile.Read(ref _priorityWaiters);
+    public float LastQueueWaitMs => _queueWaitTracker.GetFreshLastMs();
+    public float LastWriteDurationMs => (float)(Interlocked.Read(ref _lastWriteDurationUs) / 1000.0);
+    public QueueWaitWindowMetrics ConsumeWaitWindowSnapshot() => _queueWaitTracker.ConsumeWindow();
+
+    private void RecordSentBytes(int bytes)
+    {
+        Interlocked.Add(ref BytesSent, bytes);
+        long bucketTick = Environment.TickCount64 / 250;
+        int slot = (int)(bucketTick & 7);
+        lock (_throughputLock)
+        {
+            if (_bucketSecondTicks[slot] != bucketTick)
+            {
+                _bucketSecondTicks[slot] = bucketTick;
+                _bucketBytes[slot] = bytes;
+            }
+            else
+            {
+                _bucketBytes[slot] += bytes;
+            }
+        }
+    }
+
+    public (float avgMbps, float peakMbps) GetWindowedThroughputMbps(int windowMs = 500)
+    {
+        long nowTick = Environment.TickCount64 / 250;
+        long totalBytes = 0;
+        long maxBucketBytes = 0;
+        int activeWindowBuckets = Math.Clamp(windowMs / 250, 1, 8);
+        lock (_throughputLock)
+        {
+            for (int i = 0; i < 8; i++)
+            {
+                if (nowTick - _bucketSecondTicks[i] < activeWindowBuckets && _bucketBytes[i] > 0)
+                {
+                    totalBytes += _bucketBytes[i];
+                    if (_bucketBytes[i] > maxBucketBytes)
+                        maxBucketBytes = _bucketBytes[i];
+                }
+            }
+        }
+
+        double windowSec = activeWindowBuckets * 0.25;
+        float avgMbps = (float)(totalBytes * 8.0 / windowSec / 1_000_000.0);
+        float peakMbps = (float)(maxBucketBytes * 8.0 / 0.25 / 1_000_000.0);
+        return (avgMbps, peakMbps);
+    }
 
     private SecureChannel(Stream stream, byte[] sendKey, byte[] recvKey, byte[] transcript)
     {
         _stream = stream;
+        _trackWriteWait = stream is not RemoteDesk.Net.ReliableUdpStream;
         _sendAes = new AesGcm(sendKey, TagSize);
         _recvAes = new AesGcm(recvKey, TagSize);
         Transcript = transcript;
@@ -76,29 +136,105 @@ internal sealed class SecureChannel : IDisposable
     }
 
     // ---------------- 加密訊息 ----------------
-    public async Task SendAsync(ReadOnlyMemory<byte> plain, CancellationToken ct = default)
+    public async Task SendAsync(ReadOnlyMemory<byte> plain, bool highPriority = false, CancellationToken ct = default)
     {
         var frame = new byte[4 + plain.Length + TagSize];
         BinaryPrimitives.WriteInt32LittleEndian(frame, plain.Length + TagSize);
-        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
-        try
+
+        if (highPriority)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            Span<byte> nonce = stackalloc byte[12];
-            BinaryPrimitives.WriteUInt64LittleEndian(nonce[4..], _sendCounter++);
-            _sendAes.Encrypt(nonce, plain.Span, frame.AsSpan(4, plain.Length), frame.AsSpan(4 + plain.Length, TagSize));
-            await _stream.WriteAsync(frame, ct).ConfigureAwait(false);
-            Interlocked.Add(ref BytesSent, frame.Length);
+            Interlocked.Increment(ref _priorityWaiters);
+            try
+            {
+                await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _priorityWaiters);
+            }
+
+            try
+            {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+                Span<byte> nonce = stackalloc byte[12];
+                BinaryPrimitives.WriteUInt64LittleEndian(nonce[4..], _sendCounter++);
+                _sendAes.Encrypt(nonce, plain.Span, frame.AsSpan(4, plain.Length), frame.AsSpan(4 + plain.Length, TagSize));
+                long writeStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                await _stream.WriteAsync(frame, ct).ConfigureAwait(false);
+                long writeUs = (long)System.Diagnostics.Stopwatch.GetElapsedTime(writeStart).TotalMicroseconds;
+                Interlocked.Exchange(ref _lastWriteDurationUs, writeUs);
+                RecordSentBytes(frame.Length);
+            }
+            finally { _writeLock.Release(); }
         }
-        finally { _writeLock.Release(); }
+        else
+        {
+            // 低優先級進入低優先級排隊門閥，確保高優先級封包永遠能插隊在所有等待中的低優先級封包之前
+            long waitId = _queueWaitTracker.BeginWait(out long queueStart);
+            bool waitEnded = false;
+            Interlocked.Increment(ref _pendingLowPriority);
+            try
+            {
+                await _lowPriorityLock.WaitAsync(ct).ConfigureAwait(false);
+                try
+                {
+                    // 若有高優先級控制封包 (滑鼠/鍵盤/ACK/Ping) 正在等待，低優先級 (影像資料/剪貼簿) 稍作讓步
+                    while (Volatile.Read(ref _priorityWaiters) > 0)
+                    {
+                        await Task.Yield();
+                    }
+
+                    await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+                    try
+                    {
+                        if (!_trackWriteWait)
+                        {
+                            // ReliableUdpStream 本身透過 _semWaitTracker 獨立量測滑動視窗阻塞，排除 Micro-Pacing 睡眠干擾
+                            _queueWaitTracker.EndWait(waitId, queueStart);
+                            waitEnded = true;
+                        }
+
+                        ObjectDisposedException.ThrowIf(_disposed, this);
+                        Span<byte> nonce = stackalloc byte[12];
+                        BinaryPrimitives.WriteUInt64LittleEndian(nonce[4..], _sendCounter++);
+                        _sendAes.Encrypt(nonce, plain.Span, frame.AsSpan(4, plain.Length), frame.AsSpan(4 + plain.Length, TagSize));
+                        long writeStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                        await _stream.WriteAsync(frame, ct).ConfigureAwait(false);
+                        long writeUs = (long)System.Diagnostics.Stopwatch.GetElapsedTime(writeStart).TotalMicroseconds;
+                        Interlocked.Exchange(ref _lastWriteDurationUs, writeUs);
+                        RecordSentBytes(frame.Length);
+
+                        if (_trackWriteWait)
+                        {
+                            // TCP/Relay 等非滑動視窗串流：將底層 Socket/寫入阻塞納入完整佇列等待視窗，涵蓋單執行緒阻塞與 OngoingWait
+                            _queueWaitTracker.EndWait(waitId, queueStart);
+                            waitEnded = true;
+                        }
+                    }
+                    finally { _writeLock.Release(); }
+                }
+                finally { _lowPriorityLock.Release(); }
+            }
+            finally
+            {
+                if (!waitEnded) _queueWaitTracker.CancelWait(waitId);
+                Interlocked.Decrement(ref _pendingLowPriority);
+            }
+        }
     }
 
+    public Task SendAsync(ReadOnlyMemory<byte> plain, CancellationToken ct) =>
+        SendAsync(plain, highPriority: false, ct);
+
     /// <summary>傳送訊息，忽略連線已中斷的例外（用於非關鍵通知）。</summary>
-    public async Task<bool> TrySendAsync(ReadOnlyMemory<byte> plain, CancellationToken ct = default)
+    public async Task<bool> TrySendAsync(ReadOnlyMemory<byte> plain, bool highPriority = false, CancellationToken ct = default)
     {
-        try { await SendAsync(plain, ct).ConfigureAwait(false); return true; }
+        try { await SendAsync(plain, highPriority, ct).ConfigureAwait(false); return true; }
         catch { return false; }
     }
+
+    public Task<bool> TrySendAsync(ReadOnlyMemory<byte> plain, CancellationToken ct) =>
+        TrySendAsync(plain, highPriority: false, ct);
 
     /// <summary>同步發送訊息並立即 Flush（用於連線關閉前的關鍵 Disconnect 封包，防止非同步未完成即被釋放）。</summary>
     public bool SendSync(ReadOnlyMemory<byte> plain, int timeoutMs = 500)
@@ -115,7 +251,7 @@ internal sealed class SecureChannel : IDisposable
             _sendAes.Encrypt(nonce, plain.Span, frame.AsSpan(4, plain.Length), frame.AsSpan(4 + plain.Length, TagSize));
             _stream.Write(frame);
             _stream.Flush();
-            Interlocked.Add(ref BytesSent, frame.Length);
+            RecordSentBytes(frame.Length);
             return true;
         }
         catch { return false; }
@@ -164,6 +300,8 @@ internal sealed class SecureChannel : IDisposable
         try { _stream.Dispose(); } catch { }
         _sendAes.Dispose();
         _recvAes.Dispose();
+        _writeLock.Dispose();
+        _lowPriorityLock.Dispose();
     }
 
     // ---------------- 握手 ----------------
@@ -184,11 +322,18 @@ internal sealed class SecureChannel : IDisposable
 
     /// <summary>檢視端：送出 ClientHello，取得 ServerHello 並建立加密通道（尚未驗證身分）。</summary>
     public static async Task<(SecureChannel channel, ServerHello hello)> ClientHandshakeAsync(
-        Stream stream, string viewerId, string viewerName, CancellationToken ct)
+        Stream stream,
+        string viewerId,
+        string viewerName,
+        CancellationToken ct,
+        ProtocolCapabilities capabilities = ProtocolCapabilities.FrameSeqAck)
     {
         using var ecdh = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
-        var clientHello = PacketWriter.Raw(256).Raw(Protocol.Magic).U16(Protocol.Version)
-            .Str(viewerId).Str(viewerName).Bytes(ecdh.ExportSubjectPublicKeyInfo()).ToArray();
+        var helloWriter = PacketWriter.Raw(256).Raw(Protocol.Magic).U16(Protocol.Version)
+            .Str(viewerId).Str(viewerName).Bytes(ecdh.ExportSubjectPublicKeyInfo());
+        if (capabilities != ProtocolCapabilities.None)
+            helloWriter.U32((uint)capabilities);
+        var clientHello = helloWriter.ToArray();
         await WritePlainAsync(stream, clientHello, ct).ConfigureAwait(false);
 
         var serverHelloBytes = await ReadPlainAsync(stream, 8192, ct).ConfigureAwait(false);
@@ -206,8 +351,11 @@ internal sealed class SecureChannel : IDisposable
         var r = new PacketReader(clientHelloBytes);
         if (!r.Raw(4).SequenceEqual(Protocol.Magic)) throw new InvalidDataException("非 RemoteDesk 連線");
         var ver = r.U16();
-        var ch = new ClientHello(ver, r.Str(), r.Str());
+        var viewerId = r.Str();
+        var viewerName = r.Str();
         var clientPub = r.Bytes().ToArray();
+        var clientCaps = r.Remaining >= 4 ? (ProtocolCapabilities)r.U32() : ProtocolCapabilities.None;
+        var ch = new ClientHello(ver, viewerId, viewerName, clientCaps);
 
         using var ecdh = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
         var sh = makeHello(ch);
@@ -221,8 +369,8 @@ internal sealed class SecureChannel : IDisposable
     public static void TuneSocket(Socket s)
     {
         s.NoDelay = true;
-        s.SendBufferSize = 4 * 1024 * 1024;
-        s.ReceiveBufferSize = 4 * 1024 * 1024;
+        s.SendBufferSize = 256 * 1024; // 調整為 256 KB (杜絕 TCP 4MB 緩衝膨脹延遲 3 秒)
+        s.ReceiveBufferSize = 1024 * 1024;
         s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
         try
         {
@@ -234,17 +382,27 @@ internal sealed class SecureChannel : IDisposable
     }
 }
 
-internal sealed record ClientHello(ushort Version, string ViewerId, string ViewerName);
+internal sealed record ClientHello(
+    ushort Version,
+    string ViewerId,
+    string ViewerName,
+    ProtocolCapabilities Capabilities = ProtocolCapabilities.None);
 
-internal enum AuthMethod : byte { Password = 1, RequestAccess = 2 }
+internal enum AuthMethod : byte { Password = 1, RequestAccess = 2, DeviceIdentity = 3 }
 
 internal sealed record ServerHello(
     ushort Version, string HostId, string HostName, byte[] Salt, int Iterations,
-    bool HasPassword, bool AllowInteractive, bool Busy)
+    bool HasPassword, bool AllowInteractive, bool Busy,
+    ProtocolCapabilities Capabilities = ProtocolCapabilities.None)
 {
-    public byte[] Serialize(byte[] pub) =>
-        PacketWriter.Raw(256).Raw(Protocol.Magic).U16(Version).Str(HostId).Str(HostName).Bytes(pub)
-            .Bytes(Salt).I32(Iterations).Bool(HasPassword).Bool(AllowInteractive).Bool(Busy).ToArray();
+    public byte[] Serialize(byte[] pub)
+    {
+        var w = PacketWriter.Raw(256).Raw(Protocol.Magic).U16(Version).Str(HostId).Str(HostName).Bytes(pub)
+            .Bytes(Salt).I32(Iterations).Bool(HasPassword).Bool(AllowInteractive).Bool(Busy);
+        if (Capabilities != ProtocolCapabilities.None)
+            w.U32((uint)Capabilities);
+        return w.ToArray();
+    }
 
     public static ServerHello Parse(byte[] data, out byte[] pub)
     {
@@ -255,6 +413,11 @@ internal sealed record ServerHello(
         var name = r.Str();
         pub = r.Bytes().ToArray();
         var salt = r.Bytes().ToArray();
-        return new ServerHello(ver, id, name, salt, r.I32(), r.Bool(), r.Bool(), r.Bool());
+        int iterations = r.I32();
+        bool hasPassword = r.Bool();
+        bool allowInteractive = r.Bool();
+        bool busy = r.Bool();
+        var capabilities = r.Remaining >= 4 ? (ProtocolCapabilities)r.U32() : ProtocolCapabilities.None;
+        return new ServerHello(ver, id, name, salt, iterations, hasPassword, allowInteractive, busy, capabilities);
     }
 }

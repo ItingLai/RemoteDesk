@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Win32;
+using RemoteDesk.Net;
 
 namespace RemoteDesk.Common;
 
@@ -12,16 +13,24 @@ internal sealed class HostConfig
     public string DeviceId { get; set; } = "";
     public string DeviceName { get; set; } = Environment.MachineName;
     public int TcpPort { get; set; } = Protocol.DefaultTcpPort;
+    /// <summary>中央協調伺服器網址 (預設為 https://signal.remotedesk.ink)，留空則僅使用區域網路原生模式。</summary>
+    public string SignalingServerUrl { get; set; } = "https://signal.remotedesk.ink";
+    /// <summary>無人值守模式：預設關閉。僅允許已在 TrustStore 中授權之可信裝置連入。</summary>
+    public bool UnattendedAccessEnabled { get; set; } = false;
+    /// <summary>是否自動接受可信裝置之連線請求。</summary>
+    public bool AutoAcceptTrustedDevices { get; set; } = true;
     /// <summary>無人值守密碼：PBKDF2 鹽值 (Base64)。</summary>
     public string? PasswordSalt { get; set; }
     /// <summary>無人值守密碼：PBKDF2 驗證值 (Base64)。</summary>
     public string? PasswordVerifier { get; set; }
     public int PasswordIterations { get; set; } = 120_000;
-    /// <summary>允許未持有密碼的連線請求，由本機使用者按「接受」。</summary>
+    /// <summary>允許未持有可信授權的連線請求，由本機使用者按「接受」。</summary>
     public bool AllowInteractive { get; set; } = true;
     public bool HostEnabled { get; set; } = true;
     /// <summary>連線時是否同步剪貼簿。</summary>
     public bool AllowClipboard { get; set; } = true;
+    /// <summary>VPN 虛擬網卡納入 P2P 候選端點之策略（Auto / Include / Exclude）。</summary>
+    public VpnCandidatePolicy VpnCandidatePolicy { get; set; } = VpnCandidatePolicy.Auto;
 
     [JsonIgnore] public bool HasPassword => !string.IsNullOrEmpty(PasswordVerifier) && !string.IsNullOrEmpty(PasswordSalt);
 
@@ -107,6 +116,7 @@ internal sealed class ViewerConfig
     public int Quality { get; set; } = 70;
     public int MaxFps { get; set; } = 30;
     public bool Lossless { get; set; } = true;
+    public ResolutionMode ResolutionMode { get; set; } = ResolutionMode.Auto;
     public bool FitToWindow { get; set; } = true;
     public bool SyncClipboard { get; set; } = true;
     public string ViewerId { get; set; } = "";

@@ -25,6 +25,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Content Include="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\RemoteDesk\RemoteDesk.csproj" />
     <ProjectReference Include="..\..\src\RemoteDesk.Installer\RemoteDesk.Installer.csproj" />
   </ItemGroup>

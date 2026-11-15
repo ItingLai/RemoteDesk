@@ -19,7 +19,34 @@ internal sealed class ConnectPasswordDialog : Form
 
     public string Password => _inputPassword.Password;
     public bool RememberPassword => _chkRemember.Checked;
-    public bool IsInteractiveRequested => false;
+    public bool IsInteractiveRequested { get; private set; }
+    public bool WasRemoteAccepted { get; private set; }
+    public event Action<string, bool>? PasswordSubmitted;
+
+    public void RemoteAccepted()
+    {
+        if (InvokeRequired)
+        {
+            BeginInvoke((Action)RemoteAccepted);
+            return;
+        }
+        WasRemoteAccepted = true;
+        DialogResult = DialogResult.OK;
+        Close();
+    }
+
+    public void SetErrorMessage(string error)
+    {
+        if (InvokeRequired)
+        {
+            BeginInvoke(() => SetErrorMessage(error));
+            return;
+        }
+        _lblPrompt.Text = error;
+        _lblPrompt.ForeColor = Theme.Warning;
+        _btnConnect.Enabled = true;
+        _btnConnect.Text = "連線";
+    }
 
     public ConnectPasswordDialog(string deviceName, string? prefilledPassword)
         : this(deviceName, deviceName, prefilledPassword, allowInteractive: false, errorMessage: null)
@@ -65,7 +92,7 @@ internal sealed class ConnectPasswordDialog : Form
         bool hasError = !string.IsNullOrEmpty(errorMessage);
         _lblPrompt = new Label
         {
-            Text = hasError ? errorMessage! : "請輸入目標電腦的遠端存取密碼以進行連線：",
+            Text = hasError ? errorMessage! : "目標電腦已跳出連線授權確認。您可等待對方接受，或輸入密碼連線：",
             ForeColor = hasError ? Theme.Warning : Theme.TextSecondary,
             Font = Theme.CreateFont(9f),
             Location = new Point(22, 72),
@@ -77,11 +104,6 @@ internal sealed class ConnectPasswordDialog : Form
             Location = new Point(22, 98),
             Size = new Size(416, 44),
             Password = prefilledPassword ?? ""
-        };
-        _inputPassword.ReturnPressed += () =>
-        {
-            DialogResult = DialogResult.OK;
-            Close();
         };
 
         _chkRemember = new CheckBox
@@ -119,10 +141,28 @@ internal sealed class ConnectPasswordDialog : Form
             ForeColor = Color.White,
             FlatStyle = FlatStyle.Flat,
             Font = Theme.CreateFont(9.5f, FontStyle.Bold),
-            Cursor = Cursors.Hand,
-            DialogResult = DialogResult.OK
+            Cursor = Cursors.Hand
         };
         _btnConnect.FlatAppearance.BorderSize = 0;
+        _btnConnect.Click += (_, _) =>
+        {
+            if (PasswordSubmitted != null)
+            {
+                _btnConnect.Enabled = false;
+                _btnConnect.Text = "驗證中...";
+                PasswordSubmitted.Invoke(Password, RememberPassword);
+            }
+            else
+            {
+                DialogResult = DialogResult.OK;
+                Close();
+            }
+        };
+
+        _inputPassword.ReturnPressed += () =>
+        {
+            _btnConnect.PerformClick();
+        };
 
         Controls.AddRange(new Control[] { lblTitle, lblDevice, _lblPrompt, _inputPassword, _chkRemember, _btnCancel, _btnConnect });
         AcceptButton = _btnConnect;

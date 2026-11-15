@@ -29,6 +29,8 @@ internal enum HostMsg : byte
     Notice = 0x09,
     StreamInfo = 0x0A,
     Disconnect = 0x0B,
+    StreamConfig = 0x0C,
+    StreamTelemetry = 0x0D,
 }
 
 /// <summary>檢視端 → 主機訊息。</summary>
@@ -51,6 +53,8 @@ internal enum ViewerMsg : byte
     ReleaseAll = 0x4F,
     RequestKeyframe = 0x50,
     Disconnect = 0x51,
+    StreamConfigAck = 0x52,
+    ViewerTelemetry = 0x53,
 }
 
 internal enum MouseButtonId : byte { Left = 0, Right = 1, Middle = 2, X1 = 3, X2 = 4 }
@@ -69,7 +73,36 @@ internal enum ImeSyncMode : byte
 [Flags]
 internal enum KeyFlags : byte { None = 0, Extended = 1, Up = 2 }
 
-internal enum TileEncoding : byte { Jpeg = 0, Deflate = 1 }
+/// <summary>握手階段協商的協定擴充能力（向後相容可選欄位）。</summary>
+[Flags]
+internal enum ProtocolCapabilities : uint
+{
+    None = 0,
+    FrameSeqAck = 1 << 0,
+}
+
+/// <summary>HostSession 執行期採用的 FrameAck 模式（握手時決定，互不混合）。</summary>
+internal enum FrameAckMode : byte
+{
+    Legacy = 0,
+    Sequence = 1,
+}
+
+/// <summary>FrameAck 拒絕或忽略原因分類。</summary>
+internal enum FrameAckRejectReason : byte
+{
+    None = 0,
+    InvalidFrameAckLength = 1,
+    LegacyAckInSequenceMode = 2,
+    StaleFrameAck = 3,
+    DuplicateFrameAck = 4,
+    UnknownFrameAck = 5,
+}
+
+internal enum TileEncoding : byte { Jpeg = 0, Deflate = 1, JpegDownscaled2x = 2 }
+
+/// <summary>位移矩形（Move Rectangle）：來源點平移至目的地矩形。</summary>
+internal readonly record struct MoveRectangle(System.Drawing.Point SourcePoint, System.Drawing.Rectangle DestinationRect);
 
 internal readonly record struct ImeState(long KeyboardLayout, bool Open, int Conversion)
 {
@@ -121,6 +154,8 @@ internal sealed class PacketWriter
     public PacketWriter I32(int v) { Ensure(4); BinaryPrimitives.WriteInt32LittleEndian(_buf.AsSpan(_pos), v); _pos += 4; return this; }
     public PacketWriter U32(uint v) { Ensure(4); BinaryPrimitives.WriteUInt32LittleEndian(_buf.AsSpan(_pos), v); _pos += 4; return this; }
     public PacketWriter I64(long v) { Ensure(8); BinaryPrimitives.WriteInt64LittleEndian(_buf.AsSpan(_pos), v); _pos += 8; return this; }
+    public PacketWriter F32(float v) { Ensure(4); BinaryPrimitives.WriteSingleLittleEndian(_buf.AsSpan(_pos), v); _pos += 4; return this; }
+    public PacketWriter F64(double v) { Ensure(8); BinaryPrimitives.WriteDoubleLittleEndian(_buf.AsSpan(_pos), v); _pos += 8; return this; }
 
     public PacketWriter Bytes(ReadOnlySpan<byte> data)
     {
@@ -173,6 +208,8 @@ internal ref struct PacketReader
     public int I32() { Need(4); var v = BinaryPrimitives.ReadInt32LittleEndian(_buf[_pos..]); _pos += 4; return v; }
     public uint U32() { Need(4); var v = BinaryPrimitives.ReadUInt32LittleEndian(_buf[_pos..]); _pos += 4; return v; }
     public long I64() { Need(8); var v = BinaryPrimitives.ReadInt64LittleEndian(_buf[_pos..]); _pos += 8; return v; }
+    public float F32() { Need(4); var v = BinaryPrimitives.ReadSingleLittleEndian(_buf[_pos..]); _pos += 4; return v; }
+    public double F64() { Need(8); var v = BinaryPrimitives.ReadDoubleLittleEndian(_buf[_pos..]); _pos += 8; return v; }
 
     public ReadOnlySpan<byte> Bytes()
     {
@@ -226,4 +263,204 @@ internal static class MessageCodec
 
     public static byte[] ReadWallpaper(ref PacketReader r) =>
         r.Bytes().ToArray();
+
+    public static byte[] StreamConfig(
+        uint configVersion,
+        int originalWidth,
+        int originalHeight,
+        int streamWidth,
+        int streamHeight,
+        ResolutionLevel level,
+        ResolutionMode mode,
+        string? reason) =>
+        new PacketWriter((byte)HostMsg.StreamConfig, 64)
+            .U32(configVersion)
+            .I32(originalWidth)
+            .I32(originalHeight)
+            .I32(streamWidth)
+            .I32(streamHeight)
+            .U8((byte)level)
+            .U8((byte)mode)
+            .Str(reason)
+            .ToArray();
+
+    public static (uint configVersion, int origW, int origH, int streamW, int streamH, ResolutionLevel level, ResolutionMode mode, string reason) ReadStreamConfig(ref PacketReader r) =>
+        (r.U32(), r.I32(), r.I32(), r.I32(), r.I32(), (ResolutionLevel)r.U8(), (ResolutionMode)r.U8(), r.Str());
+
+    public static byte[] StreamConfigAck(uint configVersion, int streamWidth, int streamHeight) =>
+        new PacketWriter((byte)ViewerMsg.StreamConfigAck, 16)
+            .U32(configVersion)
+            .I32(streamWidth)
+            .I32(streamHeight)
+            .ToArray();
+
+    public static (uint configVersion, int streamW, int streamH) ReadStreamConfigAck(ref PacketReader r) =>
+        (r.U32(), r.I32(), r.I32());
+
+    public static byte[] LegacyFrameAck() =>
+        new PacketWriter((byte)ViewerMsg.FrameAck, 1).ToArray();
+
+    public static byte[] FrameAck(uint frameSeq) =>
+        new PacketWriter((byte)ViewerMsg.FrameAck, 5).U32(frameSeq).ToArray();
+
+    public static byte[] StreamTelemetry(HostStreamTelemetry t) =>
+        new PacketWriter((byte)HostMsg.StreamTelemetry, 256)
+            .U32(t.ConfigVersion)
+            .U8((byte)t.Mode)
+            .U8((byte)t.Level)
+            .I32(t.OriginalWidth)
+            .I32(t.OriginalHeight)
+            .I32(t.StreamWidth)
+            .I32(t.StreamHeight)
+            .I32(t.Quality)
+            .I32(t.TargetFps)
+            .F32(t.ActualSendFps)
+            .F32(t.ViewerRenderFps)
+            .I64(t.FrameDropCount)
+            .I32(t.SendQueuePending)
+            .F32(t.SendQueueWaitMs)
+            .F32(t.UdpRawLossRate)
+            .F32(t.RetransmissionRate)
+            .F32(t.ArqFinalSuccessRate)
+            .I32(t.InflightPackets)
+            .I32(t.MaxWindowSize)
+            .I32(t.RtoTimeoutCount)
+            .I32(t.FastRetransmitCount)
+            .F32(t.RttMs)
+            .F32(t.CurrentRtoMs)
+            .F32(t.EndToEndDelayMs)
+            .F32(t.AvgThroughputMbps)
+            .F32(t.PeakThroughputMbps)
+            .F32(t.EstimatedBandwidthMbps)
+            .I32(t.AverageFrameSizeBytes)
+            .F32(t.AvgEncodeDurationMs)
+            .F32(t.AvgDecodeDurationMs)
+            .F32(t.AvgRenderDurationMs)
+            .I32(t.DecodeFailureCount)
+            .Bool(t.CongestionWarning)
+            .Bool(t.IsUdpTransport)
+            .Str(t.LastSwitchReason)
+            .Str(t.TransportSummary)
+            .F32(t.SendQueueWaitLastMs)
+            .F32(t.SendQueueWaitMaxMs)
+            .F32(t.SendQueueWaitAvgMs)
+            .F32(t.SourceFrameRate)
+            .F32(t.CaptureFrameRate)
+            .F32(t.SendFrameRate)
+            .F32(t.RenderFrameRate)
+            .I32(t.TargetFrameRate)
+            .I32(t.TelemetryWindowMs)
+            .Bool(t.IsStreamIdle)
+            .F32(t.GoodputMbps)
+            .F32(t.WireThroughputMbps)
+            .I32(t.EffectiveMaxInflightFrames)
+            .Str(t.EndToEndDelayStages)
+            .ToArray();
+
+    public static HostStreamTelemetry ReadStreamTelemetry(ref PacketReader r)
+    {
+        var t = new HostStreamTelemetry
+        {
+            ConfigVersion = r.U32(),
+            Mode = (ResolutionMode)r.U8(),
+            Level = (ResolutionLevel)r.U8(),
+            OriginalWidth = r.I32(),
+            OriginalHeight = r.I32(),
+            StreamWidth = r.I32(),
+            StreamHeight = r.I32(),
+            Quality = r.I32(),
+            TargetFps = r.I32(),
+            ActualSendFps = r.F32(),
+            ViewerRenderFps = r.F32(),
+            FrameDropCount = r.I64(),
+            SendQueuePending = r.I32(),
+            SendQueueWaitMs = r.F32(),
+            UdpRawLossRate = r.F32(),
+            RetransmissionRate = r.F32(),
+            ArqFinalSuccessRate = r.F32(),
+            InflightPackets = r.I32(),
+            MaxWindowSize = r.I32(),
+            RtoTimeoutCount = r.I32(),
+            FastRetransmitCount = r.I32(),
+            RttMs = r.F32(),
+            CurrentRtoMs = r.F32(),
+            EndToEndDelayMs = r.F32(),
+            AvgThroughputMbps = r.F32(),
+            PeakThroughputMbps = r.F32(),
+            EstimatedBandwidthMbps = r.F32(),
+            AverageFrameSizeBytes = r.I32(),
+            AvgEncodeDurationMs = r.F32(),
+            AvgDecodeDurationMs = r.F32(),
+            AvgRenderDurationMs = r.F32(),
+            DecodeFailureCount = r.I32(),
+            CongestionWarning = r.Bool(),
+            IsUdpTransport = r.Bool(),
+            LastSwitchReason = r.Str(),
+            TransportSummary = r.Str()
+        };
+        if (r.Remaining >= 32)
+        {
+            t.SendQueueWaitLastMs = r.F32();
+            t.SendQueueWaitMaxMs = r.F32();
+            t.SendQueueWaitAvgMs = r.F32();
+            t.SourceFrameRate = r.F32();
+            t.CaptureFrameRate = r.F32();
+            t.SendFrameRate = r.F32();
+            t.RenderFrameRate = r.F32();
+            t.TargetFrameRate = r.I32();
+        }
+        else
+        {
+            t.SendQueueWaitLastMs = t.SendQueueWaitMs;
+            t.SendQueueWaitMaxMs = t.SendQueueWaitMs;
+            t.SendQueueWaitAvgMs = t.SendQueueWaitMs;
+            t.SendFrameRate = t.ActualSendFps;
+            t.RenderFrameRate = t.ViewerRenderFps;
+            t.TargetFrameRate = t.TargetFps;
+        }
+        if (r.Remaining >= 17)
+        {
+            t.TelemetryWindowMs = r.I32();
+            t.IsStreamIdle = r.Bool();
+            t.GoodputMbps = r.F32();
+            t.WireThroughputMbps = r.F32();
+            t.EffectiveMaxInflightFrames = r.I32();
+        }
+        if (r.Remaining >= 4)
+        {
+            t.EndToEndDelayStages = r.Str();
+        }
+        return t;
+    }
+
+    public static byte[] ViewerTelemetry(ViewerTelemetrySnapshot v) =>
+        new PacketWriter((byte)ViewerMsg.ViewerTelemetry, 36)
+            .U32(v.ConfigVersion)
+            .F32(v.RenderFps)
+            .F32(v.AvgDecodeDurationMs)
+            .F32(v.AvgRenderDurationMs)
+            .F32(v.EndToEndDelayMs)
+            .I32(v.DecodeFailureCount)
+            .I32(v.TelemetryWindowMs)
+            .Bool(v.IsIdle)
+            .ToArray();
+
+    public static ViewerTelemetrySnapshot ReadViewerTelemetry(ref PacketReader r)
+    {
+        var v = new ViewerTelemetrySnapshot
+        {
+            ConfigVersion = r.U32(),
+            RenderFps = r.F32(),
+            AvgDecodeDurationMs = r.F32(),
+            AvgRenderDurationMs = r.F32(),
+            EndToEndDelayMs = r.F32(),
+            DecodeFailureCount = r.I32()
+        };
+        if (r.Remaining >= 5)
+        {
+            v.TelemetryWindowMs = r.I32();
+            v.IsIdle = r.Bool();
+        }
+        return v;
+    }
 }

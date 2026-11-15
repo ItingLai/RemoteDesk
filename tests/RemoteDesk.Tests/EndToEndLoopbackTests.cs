@@ -92,13 +92,16 @@ public class EndToEndLoopbackTests
         Assert.NotNull(monitors);
         Assert.NotEmpty(monitors);
 
-        // 4. 驗證收到畫面幀
+        // 4. 驗證收到畫面幀與原生解析度組態
         var frameTask = await Task.WhenAny(frameReceivedTcs.Task, Task.Delay(8000, cts.Token));
         Assert.True(frameTask == frameReceivedTcs.Task, "應在數秒內成功接收並解碼第一幀畫面");
         var dirtyRect = await frameReceivedTcs.Task;
         Assert.False(dirtyRect.IsEmpty);
         Assert.True(viewerSession.RemoteWidth > 0);
         Assert.True(viewerSession.RemoteHeight > 0);
+        Assert.Equal(viewerSession.OriginalWidth, viewerSession.StreamWidth);
+        Assert.Equal(ResolutionLevel.Level0, viewerSession.CurrentResolutionLevel);
+        Assert.True(viewerSession.StreamConfigVersion >= 1);
 
         // 5. 測試雙向輸入法狀態傳遞
         var testIme = new ImeState(0x04040404, Open: true, Conversion: 0x0001);

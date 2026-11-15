@@ -1554,6 +1554,367 @@ public class UiComponentTests
         }
     }
 
+    [Fact]
+    public void ProductVersion_ConformsToSemVerAndFourPartManifestRule()
+    {
+        string repoRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../.."));
+        string ver = RemoteDesk.Installer.InstallerEngine.AppVersion;
+
+        Assert.Equal("2.0.0", ver);
+        Assert.Matches(@"^\d+\.\d+\.\d+$", ver);
+        Assert.Equal(ver, typeof(MainForm).Assembly.GetName().Version?.ToString(3));
+        Assert.Equal(ver, typeof(RemoteDesk.Installer.InstallerEngine).Assembly.GetName().Version?.ToString(3));
+
+        string bundleWxs = File.ReadAllText(Path.Combine(repoRoot, "installer", "Bundle.wxs"));
+        string pkgWxs = File.ReadAllText(Path.Combine(repoRoot, "installer", "Package.wxs"));
+        Assert.Contains($"Version=\"{ver}\"", bundleWxs);
+        Assert.Contains($"Version=\"{ver}\"", pkgWxs);
+
+        string expectedManifestVer = $"{ver}.0";
+        string appManifest = File.ReadAllText(Path.Combine(repoRoot, "src", "RemoteDesk", "app.manifest"));
+        string installerManifest = File.ReadAllText(Path.Combine(repoRoot, "src", "RemoteDesk.Installer", "app.manifest"));
+        Assert.Contains($"<assemblyIdentity version=\"{expectedManifestVer}\" name=\"RemoteDesk.app\"/>", appManifest);
+        Assert.Contains($"<assemblyIdentity version=\"{expectedManifestVer}\" name=\"RemoteDesk.app\"/>", installerManifest);
+    }
+
+    [Fact]
+    public async Task DeviceOnlineStatusTracker_UpdatesNonLanDeviceStatusViaSignalingAndHandlesOfflineAndTransientErrors()
+    {
+        string tempDir = Path.Combine(Path.GetTempPath(), "RemoteDesk_StatusTest_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            using var identity = DeviceIdentity.LoadOrCreate(tempDir, "111222333", "Viewer-PC");
+            bool onlineFlag = true;
+            System.Net.HttpStatusCode statusCode = System.Net.HttpStatusCode.OK;
+            DateTime serverLastSeen = DateTime.UtcNow;
+
+            var handler = new StubSignalingHandler(id =>
+            {
+                if (statusCode != System.Net.HttpStatusCode.OK)
+                {
+                    return new System.Net.Http.HttpResponseMessage(statusCode);
+                }
+                var payload = System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    success = true,
+                    deviceId = id,
+                    deviceName = "Remote-WAN-PC",
+                    publicKey = identity.PublicKeyBase64,
+                    publicIp = "203.0.113.10",
+                    tcpPort = 21119,
+                    localIps = new[] { "10.0.0.5" },
+                    onlineStatus = onlineFlag,
+                    lastSeen = serverLastSeen
+                });
+                return new System.Net.Http.HttpResponseMessage(System.Net.HttpStatusCode.OK)
+                {
+                    Content = new System.Net.Http.StringContent(payload, System.Text.Encoding.UTF8, "application/json")
+                };
+            });
+
+            using var http = new System.Net.Http.HttpClient(handler);
+            using var client = new SignalingClient("http://localhost", identity, http);
+
+            var tracker = new DeviceOnlineStatusTracker();
+            var wanEntry = new RecentEntry { Key = "987654321", DeviceId = "987654321", Name = "Office-PC" };
+            var entries = new List<RecentEntry> { wanEntry };
+            var noLan = Array.Empty<DiscoveredDevice>();
+            var t0 = DateTime.UtcNow;
+
+            Assert.False(tracker.IsDeviceOnline(wanEntry, false, noLan, "111222333", nowUtc: t0));
+
+            // 1. Signaling 回報上線 -> 轉為在線
+            bool changed1 = await tracker.RefreshRemoteStatusesAsync(client, entries, noLan, "111222333", nowUtc: t0);
+            Assert.True(changed1);
+            Assert.True(tracker.IsDeviceOnline(wanEntry, false, noLan, "111222333", nowUtc: t0.AddSeconds(5)));
+
+            // 2. 暫時性 500 錯誤不應在 TTL 內誤閃爍離線；超過 TTL (120s) 後自然逾期
+            statusCode = System.Net.HttpStatusCode.InternalServerError;
+            bool changedTransient = await tracker.RefreshRemoteStatusesAsync(client, entries, noLan, "111222333", nowUtc: t0.AddSeconds(10));
+            Assert.False(changedTransient);
+            Assert.True(tracker.IsDeviceOnline(wanEntry, false, noLan, "111222333", nowUtc: t0.AddSeconds(30)));
+            Assert.False(tracker.IsDeviceOnline(wanEntry, false, noLan, "111222333", nowUtc: t0.AddSeconds(135)));
+
+            // 3. 重新確認在線後，伺服器回報 onlineStatus = false -> 立即轉為離線
+            statusCode = System.Net.HttpStatusCode.OK;
+            onlineFlag = true;
+            await tracker.RefreshRemoteStatusesAsync(client, entries, noLan, "111222333", nowUtc: t0.AddSeconds(140));
+            Assert.True(tracker.IsDeviceOnline(wanEntry, false, noLan, "111222333", nowUtc: t0.AddSeconds(141)));
+
+            onlineFlag = false;
+            bool changedOffline = await tracker.RefreshRemoteStatusesAsync(client, entries, noLan, "111222333", nowUtc: t0.AddSeconds(150));
+            Assert.True(changedOffline);
+            Assert.False(tracker.IsDeviceOnline(wanEntry, false, noLan, "111222333", nowUtc: t0.AddSeconds(151)));
+
+            // 4. 上線後若伺服器回報 404 NotFound -> 立即轉為離線
+            onlineFlag = true;
+            await tracker.RefreshRemoteStatusesAsync(client, entries, noLan, "111222333", nowUtc: t0.AddSeconds(160));
+            Assert.True(tracker.IsDeviceOnline(wanEntry, false, noLan, "111222333", nowUtc: t0.AddSeconds(161)));
+
+            statusCode = System.Net.HttpStatusCode.NotFound;
+            bool changedNotFound = await tracker.RefreshRemoteStatusesAsync(client, entries, noLan, "111222333", nowUtc: t0.AddSeconds(170));
+            Assert.True(changedNotFound);
+            Assert.False(tracker.IsDeviceOnline(wanEntry, false, noLan, "111222333", nowUtc: t0.AddSeconds(171)));
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task DeviceOnlineStatusTracker_LanByeSuppressesStaleSignalingUntilHeartbeatAdvances()
+    {
+        string tempDir = Path.Combine(Path.GetTempPath(), "RemoteDesk_ByeTest_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            using var identity = DeviceIdentity.LoadOrCreate(tempDir, "111222333", "Viewer-PC");
+            DateTime serverLastSeen = new DateTime(2026, 11, 14, 1, 0, 0, DateTimeKind.Utc);
+
+            var handler = new StubSignalingHandler(id =>
+            {
+                var payload = System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    success = true,
+                    deviceId = id,
+                    deviceName = "DualNet-PC",
+                    publicKey = identity.PublicKeyBase64,
+                    publicIp = "203.0.113.20",
+                    tcpPort = 21119,
+                    localIps = new[] { "192.168.1.20" },
+                    onlineStatus = true,
+                    lastSeen = serverLastSeen
+                });
+                return new System.Net.Http.HttpResponseMessage(System.Net.HttpStatusCode.OK)
+                {
+                    Content = new System.Net.Http.StringContent(payload, System.Text.Encoding.UTF8, "application/json")
+                };
+            });
+
+            using var http = new System.Net.Http.HttpClient(handler);
+            using var client = new SignalingClient("http://localhost", identity, http);
+
+            var tracker = new DeviceOnlineStatusTracker();
+            var entry = new RecentEntry { Key = "555666777", DeviceId = "555666777" };
+            var entries = new List<RecentEntry> { entry };
+            var t0 = DateTime.UtcNow;
+
+            // 先收到區網 UDP bye (LastSeen == DateTime.MinValue)
+            tracker.OnLanDeviceUpdated(new DiscoveredDevice { Id = "555666777", LastSeen = DateTime.MinValue }, utcNow: t0);
+
+            // 即便伺服器舊心跳仍在 90s 視窗內回傳 onlineStatus=true (lastSeen 未推進)，仍應保持離線
+            await tracker.RefreshRemoteStatusesAsync(client, entries, Array.Empty<DiscoveredDevice>(), "111222333", nowUtc: t0.AddSeconds(2));
+            Assert.False(tracker.IsDeviceOnline(entry, false, Array.Empty<DiscoveredDevice>(), "111222333", nowUtc: t0.AddSeconds(3)));
+
+            await tracker.RefreshRemoteStatusesAsync(client, entries, Array.Empty<DiscoveredDevice>(), "111222333", nowUtc: t0.AddSeconds(10));
+            Assert.False(tracker.IsDeviceOnline(entry, false, Array.Empty<DiscoveredDevice>(), "111222333", nowUtc: t0.AddSeconds(11)));
+
+            // 當被控端於外網重啟並送出更新之心跳 (serverLastSeen > baseline) 時，應立即轉為在線
+            serverLastSeen = serverLastSeen.AddSeconds(15);
+            bool recovered = await tracker.RefreshRemoteStatusesAsync(client, entries, Array.Empty<DiscoveredDevice>(), "111222333", nowUtc: t0.AddSeconds(20));
+            Assert.True(recovered);
+            Assert.True(tracker.IsDeviceOnline(entry, false, Array.Empty<DiscoveredDevice>(), "111222333", nowUtc: t0.AddSeconds(21)));
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task MainForm_RemoteDeviceStatusLight_UpdatesInPlaceBetweenOnlineAndOffline()
+    {
+        string tempDir = Path.Combine(Path.GetTempPath(), "RemoteDesk_MainFormStatus_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            using var identity = DeviceIdentity.LoadOrCreate(tempDir, "111222333", "Viewer-PC");
+            bool remoteOnline = false;
+
+            var handler = new StubSignalingHandler(id =>
+            {
+                var payload = System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    success = true,
+                    deviceId = id,
+                    deviceName = "Remote-Host",
+                    publicKey = identity.PublicKeyBase64,
+                    publicIp = "198.51.100.42",
+                    tcpPort = 21119,
+                    localIps = Array.Empty<string>(),
+                    onlineStatus = remoteOnline,
+                    lastSeen = DateTime.UtcNow
+                });
+                return new System.Net.Http.HttpResponseMessage(System.Net.HttpStatusCode.OK)
+                {
+                    Content = new System.Net.Http.StringContent(payload, System.Text.Encoding.UTF8, "application/json")
+                };
+            });
+
+            using var http = new System.Net.Http.HttpClient(handler);
+            using var stubSignaling = new SignalingClient("http://localhost", identity, http);
+
+            using var form = new MainForm();
+            form.Show();
+            Application.DoEvents();
+
+            form.ViewerConfigForTest.Recent.Clear();
+            form.ViewerConfigForTest.Recent.Add(new RecentEntry
+            {
+                Key = "777888999",
+                DeviceId = "777888999",
+                Name = "WAN-Workstation",
+                LastUsed = DateTime.Now
+            });
+            form.SetSignalingClientForTest(stubSignaling);
+            form.RefreshDeviceCardsForTest();
+            Application.DoEvents();
+
+            var cardsBefore = form.GetVisibleDeviceCardsForTest();
+            Assert.Single(cardsBefore);
+            var cardRef = cardsBefore[0];
+            Assert.False(cardRef.IsOnline);
+
+            // 1. 遠端電腦於 Signaling Server 上線 -> 既有卡片原地更新為綠燈在線
+            remoteOnline = true;
+            bool changedOnline = await form.RefreshRemoteDeviceStatusesOnceForTestAsync();
+            Application.DoEvents();
+            Assert.True(changedOnline);
+
+            var cardsAfterOnline = form.GetVisibleDeviceCardsForTest();
+            Assert.Single(cardsAfterOnline);
+            Assert.Same(cardRef, cardsAfterOnline[0]);
+            Assert.True(cardsAfterOnline[0].IsOnline);
+
+            // 2. 遠端電腦於 Signaling Server 離線 -> 既有卡片原地更新回紅燈離線
+            remoteOnline = false;
+            bool changedOffline = await form.RefreshRemoteDeviceStatusesOnceForTestAsync();
+            Application.DoEvents();
+            Assert.True(changedOffline);
+
+            var cardsAfterOffline = form.GetVisibleDeviceCardsForTest();
+            Assert.Single(cardsAfterOffline);
+            Assert.Same(cardRef, cardsAfterOffline[0]);
+            Assert.False(cardsAfterOffline[0].IsOnline);
+
+            form.SetSignalingClientForTest(null);
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void MainForm_SessionStatusBadge_DisplaysOnlyLatencyAndLogsFullTelemetry()
+    {
+        string tempDir = Path.Combine(Path.GetTempPath(), "RemoteDesk_BadgeTel_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            using var identity = DeviceIdentity.LoadOrCreate(tempDir, "111222333", "Viewer-PC");
+            var cfg = new ViewerConfig { ViewerId = "111222333", Quality = 70, MaxFps = 30, ResolutionMode = ResolutionMode.Auto };
+            using var discovery = new LanDiscovery("111222333");
+            using var session = new ViewerSession("999888777", cfg, discovery, "111222333", identity);
+            session.TransportModeOverrideForTest = true;
+
+            string uniqueReason = $"TelemetryLogProbe_{Guid.NewGuid():N}";
+            var tel = new HostStreamTelemetry
+            {
+                ConfigVersion = 3,
+                Mode = ResolutionMode.Auto,
+                Level = ResolutionLevel.Level1,
+                OriginalWidth = 1920,
+                OriginalHeight = 1080,
+                StreamWidth = 1440,
+                StreamHeight = 810,
+                Quality = 70,
+                TargetFps = 30,
+                ActualSendFps = 29.5f,
+                ViewerRenderFps = 29.0f,
+                FrameDropCount = 0,
+                SendQueuePending = 0,
+                SendQueueWaitMs = 2.1f,
+                RttMs = 38f,
+                CurrentRtoMs = 120f,
+                EndToEndDelayMs = 64f,
+                GoodputMbps = 12.4f,
+                WireThroughputMbps = 13.1f,
+                EstimatedBandwidthMbps = 48.0f,
+                PeakThroughputMbps = 18.2f,
+                CongestionWarning = true,
+                IsUdpTransport = true,
+                TransportSummary = "UDP P2P | Loss=0.3% | Retrans=0.3% | ARQ=100.0%",
+                LastSwitchReason = uniqueReason
+            };
+            session.DispatchForTest(MessageCodec.StreamTelemetry(tel));
+
+            using var form = new MainForm();
+            form.Show();
+            Application.DoEvents();
+
+            var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+            var sessionItemType = typeof(MainForm).GetNestedType("SessionTabItem", flags)!;
+            var tabItem = Activator.CreateInstance(sessionItemType)!;
+            sessionItemType.GetProperty("Title")!.SetValue(tabItem, "WAN-HOST");
+            sessionItemType.GetProperty("Session")!.SetValue(tabItem, session);
+
+            var lblStatusBadge = (Label)form.GetType().GetField("_lblSessionStatusBadge", flags)!.GetValue(form)!;
+            var lblSessionTitle = (Label)form.GetType().GetField("_lblSessionTitle", flags)!.GetValue(form)!;
+            var toolTip = (ToolTip)form.GetType().GetField("_sessionToolTip", flags)!.GetValue(form)!;
+
+            var updateMetrics = form.GetType().GetMethod("UpdateSessionMetrics", flags)!;
+            updateMetrics.Invoke(form, new[] { tabItem });
+            Application.DoEvents();
+
+            // 1. UI 僅顯示延遲，嚴禁向使用者暴露頻寬/FPS/傳輸通道/降解析度/壅塞警告等診斷細節
+            Assert.Equal("● 38ms", lblStatusBadge.Text);
+            Assert.Equal(Theme.Success, lblStatusBadge.ForeColor);
+
+            string badgeTip = toolTip.GetToolTip(lblStatusBadge) ?? string.Empty;
+            string titleTip = toolTip.GetToolTip(lblSessionTitle) ?? string.Empty;
+            Assert.DoesNotContain("WAN UDP", badgeTip);
+            Assert.DoesNotContain("FPS", badgeTip);
+            Assert.DoesNotContain("Mbps", badgeTip);
+            Assert.DoesNotContain("QueueWait", badgeTip);
+            Assert.DoesNotContain("頻寬不足", badgeTip);
+            Assert.Equal(string.Empty, titleTip);
+
+            // 2. 系統 Log 必須完整記錄連線品質遙測指標
+            string logFile = Path.Combine(Log.LogDirectory, $"remotedesk-{DateTime.Now:yyyyMMdd}-{Environment.ProcessId}.log");
+            Assert.True(File.Exists(logFile), $"系統日誌檔案應存在: {logFile}");
+            using var fs = new FileStream(logFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var sr = new StreamReader(fs);
+            string logContent = sr.ReadToEnd();
+            Assert.Contains("[ViewerTelemetry]", logContent);
+            Assert.Contains(uniqueReason, logContent);
+            Assert.Contains("Loss=0.3%", logContent);
+            Assert.Contains("Q=70%", logContent);
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, true); } catch { }
+        }
+    }
+
+    private sealed class StubSignalingHandler : System.Net.Http.HttpMessageHandler
+    {
+        private readonly Func<string, System.Net.Http.HttpResponseMessage> _responder;
+
+        public StubSignalingHandler(Func<string, System.Net.Http.HttpResponseMessage> responder)
+        {
+            _responder = responder;
+        }
+
+        protected override Task<System.Net.Http.HttpResponseMessage> SendAsync(System.Net.Http.HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            string seg = request.RequestUri?.Segments.LastOrDefault()?.Trim('/') ?? "";
+            return Task.FromResult(_responder(seg));
+        }
+    }
+
     private class DummyUi : IHostUi
     {
         public Task<bool> ConfirmAccessAsync(string viewerName, string viewerId, string address, string code, CancellationToken ct) => Task.FromResult(true);

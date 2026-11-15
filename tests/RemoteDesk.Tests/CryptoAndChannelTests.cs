@@ -91,7 +91,7 @@ public class CryptoAndChannelTests
         serverChan.Dispose();
     }
 
-    private sealed class DuplexStream : Stream
+    internal sealed class DuplexStream : Stream
     {
         private readonly Stream _read;
         private readonly Stream _write;

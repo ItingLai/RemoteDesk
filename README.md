@@ -1,193 +1,138 @@
-# RemoteDesk - 高效能內網原生遠端桌面系統
+# RemoteDesk (v2.0.0)
 
-RemoteDesk 是一套專為 Windows 區域網路（LAN）環境設計的高效能遠端桌面系統，以 .NET 9 (C#) 開發，整合 DirectX 11 DXGI GPU 畫面擷取、低階 Win32 鍵盤/滑鼠輸入注入、微軟輸入法狀態雙向鎖定同步，以及端對端 AES-256-GCM 認證加密通訊，提供流暢、低延遲且具備原生質感的遠端操控體驗。
-
----
-
-## 核心技術特色
-
-### 1. 原生操控與低延遲輸入
-- **硬體掃描碼（Scancodes）對映**：控制端透過底層鍵盤掛鉤（`WH_KEYBOARD_LL`）攔截 Windows 鍵、Alt+Tab、Alt+F4 等系統組合鍵並直接送至被控端，避免本機攔截，實現真實的桌面操控手感。
-- **輸入回饋迴圈防護（Echo Prevention）**：注入輸入事件時附加專屬旗標（`Protocol.InjectedMarker`），防止回饋觸發。
-- **硬體自適應游標（Hardware Cursor Tracker）**：自動擷取被控端游標圖示（含彩色、單色及 XOR 反相遮罩），於控制端畫布即時渲染，大幅降低游標跟隨延遲。
-- **連線防卡鍵保護機制**：於視窗失焦或連線中斷時自動發布按鍵釋放廣播，防止遠端按鍵持續受壓。
-
-### 2. 輸入法雙向鎖定同步（IME Lockstep Synchronization）
-- **雙向鎖定模式（Bound Mode）**：
-  - 控制端與被控端之輸入法狀態（開啟/關閉、中英轉換狀態、輸入法鍵盤配置語系）完全鎖定連動。
-  - 於控制端按下 Shift 或切換輸入法時，被控端立即同步切換；在被控端切換視窗時，控制端亦自動同步中/英狀態，解決遠端桌面常見之中英文不對稱問題。
-  - 深度相容 Windows 10/11 微軟新注音、倉頡、拼音及 IMM32 / TSF 架構輸入法。
-- **本機組字模式（Local Composition Mode）**：
-  - 適用於高延遲或特定網路環境，由本機端負責組字與候選字，遠端回傳插入點游標座標（Caret Position）定位候選視窗，確認後以 Unicode 傳送。
-
-### 3. 多螢幕偵測與 GPU 直出擷取
-- **DirectX 11 DXGI 桌面複製**：優先採用 GPU 顯存直出擷取（DXGI Desktop Duplication API），降低 CPU 資源耗損；於 UAC 安全桌面或不支援 DXGI 之環境下自動平滑降級為 GDI BitBlt 擷取。
-- **動態多螢幕管理**：支援 Per-Monitor DPI Aware 實體螢幕座標列舉，支援多螢幕熱插拔自動廣播，並提供單一螢幕獨立檢視與全螢幕合併檢視兩種模式。
-
-### 4. 無固定 IP 區域網路動態探索
-- **固定 9 位數裝置識別碼**：依據硬體特徵產生專屬 9 位數識別碼（例如 `123 456 789`），便於記憶與辨識。
-- **UDP 廣播探索協定**：背景自動廣播並探索區域網路內其他在線的 RemoteDesk 實例，主畫面即時列出主機名稱、IP 與在線狀態，支援雙擊直接發起連線。
-- **動態 IP 自動解析**：被控端即便受 DHCP 動態分配 IP，控制端輸入 9 位數 ID 即可在毫秒級時間內完成位址解析並建立連線。
-
-### 5. 端對端安全加密架構
-- **ECDH P-256 密鑰交換**：每次連線建立時動態生成橢圓曲線臨時金鑰對，具備前向安全性（Forward Secrecy）。
-- **HKDF 密鑰衍生**：分別衍生出控制端至被控端（c2s）與被控端至控制端（s2c）的獨立 AES-256-GCM 加密金鑰。
-- **認證加密（AEAD）**：所有傳輸之影像區塊、輸入控制封包及狀態通知均受 AES-256-GCM 認證加密保護，杜絕竊聽與重送竄改。
-- **雙軌認證機制**：
-  - 無人值守模式：採用 PBKDF2（120,000 次雜湊）與 HMAC 握手挑戰，密碼於本機透過 Windows DPAPI（Data Protection API）安全加密存儲。
-  - 互動授權模式：未設定密碼時，遠端連入將彈出授權對話盒，顯示連線端名稱、IP 與 6 位數安全驗證碼，供被控端審核確認。
-
-### 6. 差異影像壓縮傳輸引擎
-- **64x64 差異區塊分塊編碼**：僅針對畫面中發生變動的區域進行壓縮與傳輸，大幅減少頻寬需求。
-- **自適應影像壓縮**：動態偵測畫面變更頻率，動態區域採用高速 JPEG 壓縮確保操作流暢，靜態細節自動以無損壓縮補傳，維持文字與代碼清晰度。
-- **傳輸流量控制（Flow Control ACK）**：依據網路回應時間動態調節傳輸幀率，避免封包積壓引發畫面延遲。
+專為 Windows 10/11 環境設計的原生跨網路遠端桌面控制系統（.NET 9 + WinForms）。從 v1.x 的純區域網路架構全面演進為 **「LAN TCP 直連 + WAN 純 P2P IPv4 UDP 穿透」** 雙模傳輸架構，在保有極致低延遲、端對端 AES-256-GCM 加密與原生日文／中文輸入法同步的同時，進一步支援多網卡／雙 WAN、NAT 穿透打洞、可靠 UDP（ARQ）、連線中無縫路徑切換與自適應畫質串流。
 
 ---
 
-## 系統需求
+## v2.0.0 新版本核心特色
 
-- **作業系統**：Windows 10 / Windows 11 / Windows Server 2019 或更新版本（x64）
-- **執行環境**：.NET 9.0 Desktop Runtime（x64）
-  - 若使用 `RemoteDeskSetup.exe` 安裝檔，安裝程式會自動偵測並自微軟官方伺服器下載安裝必要的 .NET 9 執行階段。
-  - 若使用 `RemoteDesk.msi`，系統需預先安裝 .NET 9 Desktop Runtime。
+### 1. WAN 純 P2P IPv4 UDP 穿透架構
+* **去中心化影像直連**：所有螢幕串流與鍵鼠控制皆直接於受控端（Host）與控制端（Viewer）之間點對點傳輸，中央 Signaling 服務僅協助 9 位數裝置 ID 查詢與 P2P 握手協調，完全不中繼桌面影像或輸入封包。
+* **多網卡／雙 WAN 與出口路由綁定**：自動偵測本機可用 IPv4 實體／虛擬網路介面，為每張介面建立獨立 UDP Socket 並透過 Windows `IP_UNICAST_IF` 鎖定實體出口網卡，同時提供 **VPN Candidate Policy**（自動／納入／排除）設定。
+* **多 STUN 探測與 Candidate 收集**：支援對多組公開 STUN 伺服器進行並發探測，收集 `Host`、`Srflx` 與 `prflx` 候選端點並分析 NAT 映射行為。
+* **ICE 風格雙向連通性檢查與 Nomination**：依據候選優先權配對並執行雙向連通性驗證（Connectivity Check），由 `Controlling` 端統一執行 Nomination 選定最佳直連路徑，避免雙端各自切換衝突。
+* **智慧失敗分類與多輪策略性自動重試**：透過 `P2PRetryCoordinator` 依失敗原因自動切換策略重試（原有配對快驗 -> 輪替 STUN 與重整介面／Socket 重收集 -> 放寬逾時匯聚協商）。
 
----
+### 2. Reliable UDP、路徑監控與斷線無縫修復
+* **Reliable UDP ARQ 串流層 (`ReliableUdpStream`)**：完全實作標準 `System.IO.Stream`，提供 `< 1200 bytes` MTU 安全切片、256 封包滑動視窗累積 ACK、Fast Retransmit 快速重傳、RFC 6298 動態 SRTT/RTO 估算、Token Bucket 平滑發送節流（Pacing）以及 Keepalive 心跳保活，可無縫承載 ECDH + AES-256-GCM 加密通道。
+* **即時路徑品質監控與無縫切換 (`P2PPathMonitor` + `PathEpoch`)**：持續追蹤雙向心跳 RTT、滑動視窗封包遺失率與重傳率；當偵測介面斷線、NAT 映射漂移或路徑劣化時，透過 `PathEpoch` 世代防護原子切換至備援介面／路徑，維持現有工作階段不中斷。
+* **FrameSeq ACK 世代安全與自適應解析度**：導入 `FrameSeq ACK` 精準回報影格確認與往返延遲，結合 `AdaptiveResolutionController` 在「自動 / 原生鎖定 / 流暢優先」三種模式間（100% / 75% / 50%）依實際壅塞與丟包狀況平順升降解析度並動態調整 JPEG 畫質。
 
-## 下載與安裝
-
-您可以前往本專案的 [Releases 頁面](https://github.com/ItingLai/RemoteDesk/releases) 下載最新安裝套件：
-
-1. **RemoteDeskSetup.exe（推薦）**：
-   - WiX Burn 整合安裝開機導引檔（Bootstrapper）。
-   - 包含 .NET 9 Desktop Runtime 依賴偵測與線上下載，一鍵完成所有前置準備與軟體安裝。
-2. **RemoteDesk.msi**：
-   - 標準 Windows Installer 安裝套件。
-   - 適合已配置 .NET 9 執行環境之電腦、或企業網域透過 GPO 進行大量派送。
+### 3. 連線可靠度與多實例防護
+* **DNS Sinkhole 防護與 DoH 解析 (`SignalingClient`)**：支援系統 DNS 與 Cloudflare DoH (`1.1.1.1` / `1.0.0.1`) 雙路徑解析 Signaling 網域，全程強制 HTTPS / WSS TLS 憑證驗證。
+* **單實例守護與在線狀態追蹤**：`SingleInstanceGuard` 透過具名 Windows Mutex 與啟用事件避免同 Profile 重複啟動，並允許透過 `--profile <名稱>` 多組設定獨立並存；`DeviceOnlineStatusTracker` 整合主動工作階段、LAN 廣播與遠端查詢即時顯示收藏與最近連線裝置在線狀態。
 
 ---
 
-## 使用操作指南
+## 核心功能與架構
 
-### 1. 被控端設定（允許他人連入）
+### 雙軌傳輸與畫面串流
+* **DXGI Desktop Duplication 硬體加速擷取**：透過 `Vortice.Direct3D11` 與 `Vortice.DXGI` 直接由 GPU 擷取桌面畫面，低 CPU 佔用，並針對無頭環境與多螢幕具備自動切換與錯誤降級機制（GDI 備援與動態重設）。
+* **LAN 直連 + WAN P2P 自動協作**：
+  * **LAN 直連**：預設使用 TCP Port `21119` 直連，並透過 UDP Port `21118` 進行區域網路廣播自動探索。
+  * **WAN P2P**：輸入 9 位數裝置 ID 即可透過 Signaling 協調雙端 UDP 打洞建立點對點加密隧道。
+* **鼠標與多螢幕無縫體驗**：支援遠端即時游標追蹤與視覺補償、多螢幕獨立切換檢視，以及自適應解析度與 JPEG 畫質調整。
 
-1. 啟動 `RemoteDesk.exe`。
-2. 主畫面中央將顯示本機唯一的 **9 位數裝置 ID**（例如：`521 839 204`），將此號碼提供給控制端即可建立連線。
-3. 連線授權設定：
-   - **無人值守密碼連線**：
-     點擊主畫面右上角設定選單中的「安全性設定」，輸入並確認專用連線密碼後儲存。日後控制端輸入此密碼即可直接連入，無須被控端手動點擊同意。
-   - **互動確認連線**：
-     若未設置無人值守密碼，當有控制端發起連線時，被控端螢幕會彈出「連線授權確認」視窗，顯示對方的裝置名稱、來源 IP 與 6 位數核對碼，點選「允許連線」後即可放行。
+### 安全與權限控制
+* **端對端加密通道 (`SecureChannel`)**：
+  * 使用 **ECDH P-256** 執行暫態金鑰交換，並以 **HKDF** 衍生雙向獨立會話金鑰。
+  * 採用 **AES-256-GCM**（12-byte Nonce + 16-byte Auth Tag）為所有影像影格與鍵鼠指令進行認證加密，並以漸進計數器防範重放攻擊。
+* **多重授權模式**：
+  * **手動確認授權**：受控端彈出連線核准視窗，顯示請求方裝置 ID、位址及 6 位數安全驗證碼，可選擇「僅接受本次」或「接受並信任此裝置」。
+  * **無人值守永久密碼**：支援以隨機鹽值（Salt）結合 **PBKDF2-SHA256** 進行密碼驗證，透過挑戰-回應（Challenge-Response）機制於不傳輸明文密碼的前提下完成鑑權，授權資訊經 Windows **DPAPI (`ProtectedData`)** 安全加密儲存。
 
-### 2. 控制端操作（連線至遠端電腦）
-
-#### 方法 A：透過區域網路自動探索清單連線
-1. 啟動 `RemoteDesk.exe`。
-2. 主畫面中央區域的「區域網路裝置」卡片會即時列出同一子網內所有正在運行的 RemoteDesk 電腦。
-3. 點選目標電腦卡片或直接雙擊，系統即自動發起連線。
-
-#### 方法 B：透過 9 位數裝置 ID 連線
-1. 啟動 `RemoteDesk.exe`。
-2. 於主畫面輸入框中輸入目標電腦的 9 位數 ID（支援含空格或純數字輸入）。
-3. 按下鍵盤 Enter 鍵或點選連線按鈕。
-4. 依據目標電腦的設定，輸入連線密碼或等待對方授權同意。
-
-### 3. 遠端作業階段功能
-
-連線成功後將開啟遠端操控視窗，頂部工具列提供以下功能控制：
-- **螢幕切換**：若被控端配有多螢幕，可在此自由切換為「螢幕 1」、「螢幕 2」或「所有螢幕合併檢視」。
-- **輸入法綁定切換**：可即時切換輸入法「鎖定綁定模式」或「本機模式」，狀態列會顯示當前中/英文連動狀態。
-- **全螢幕切換**：按下 `F11` 鍵或工具列按鈕可於全螢幕與視窗模式之間快速切換。
-- **傳送系統組合鍵**：工具列選單提供傳送 `Ctrl+Alt+Del`、`Win+L`（鎖定畫面）等系統指令。
-- **畫面縮放比例**：支援 100% 原始尺寸點對點顯示與自動配合視窗等比例縮放。
-
-### 4. 進階命令列參數
-
-RemoteDesk 支援透過命令列指令快速啟動或執行特定工作：
-
-```powershell
-# 直接連線至指定 9 位數 ID 或 IP
-RemoteDesk.exe --connect 123456789
-RemoteDesk.exe --connect 192.168.1.100
-
-# 指定自訂設定檔設定（可用於多環境隔離）
-RemoteDesk.exe --profile Office --port 21119
-
-# 無主視窗背景服務模式
-RemoteDesk.exe --headless
-```
+### 輸入、剪切板與 IME 同步
+* **輸入模擬 (`InputInjector`)**：完整的鍵鼠事件與高解析度滾輪轉譯，支持複合組合鍵（如 Ctrl+C、Alt+Tab、Win+D 等），切換視窗或斷線時自動釋放按鍵狀態以防卡鍵。
+* **雙向剪切板同步**：控制端與受控端之間即時雙向同步文字剪貼簿，並以內容雜湊防護避免迴圈複製。
+* **遠端 IME 狀態同步 (`ImeController` / `ImeSyncClient`)**：支援全螢幕與視窗化操控下的輸入法中英狀態與複合輸入行為協調。
 
 ---
 
-## 原始碼架構與編譯
+## 系統需求與環境
 
-### 專案目錄結構
+* **作業系統**：Windows 10 / Windows 11 (x64)
+* **開發框架**：.NET 9 (`net9.0-windows`)
+* **依賴套件**：
+  * `Vortice.Direct3D11` (v3.8.3)
+  * `Vortice.DXGI` (v3.8.3)
+  * `System.Security.Cryptography.ProtectedData` (v9.0.0)
+  * `System.ServiceProcess.ServiceController` (v9.0.0)
+* **打包工具**：WiX Toolset v4+（含 `WixToolset.UI.wixext` 與 `WixToolset.Util.wixext`，建置 MSI 與 Burn Bootstrapper 時需要）
 
-```
-RemoteDesk/
-├── installer/                       # WiX 安裝程式定義與自動化建置腳本
-│   ├── Bundle.wxs                  # WiX Burn Bootstrapper 規格 (含 .NET 9 下載)
-│   ├── Package.wxs                 # WiX MSI 安裝套件規格
-│   └── build-installer.ps1         # 自動化打包建置 PowerShell 指令檔
-├── src/
-│   ├── RemoteDesk/                 # RemoteDesk 主程式核心
-│   │   ├── Common/                 # 通訊協定、AES-GCM 加密通道、設定檔持久化
-│   │   ├── Controls/               # 現代化深色 UI 自訂控制項與向量圖示
-│   │   ├── Host/                   # 被控端伺服器、DXGI 畫面擷取、輸入注入、多螢幕
-│   │   ├── Native/                 # Win32 P/Invoke 系統底層 API 封裝
-│   │   ├── Net/                    # UDP 區域網路廣播與自動探索服務
-│   │   ├── Resources/              # 程式圖示與高解析標誌素材
-│   │   ├── Viewer/                 # 控制端畫布、輸入法雙向鎖定客戶端、鍵盤掛鉤
-│   │   ├── MainForm.cs             # 主視窗控制與流程排程
-│   │   └── Program.cs              # 程式進入點與命令列剖析
-│   └── RemoteDesk.Installer/       # 備用整合型自解安裝程式專案
-├── tests/
-│   └── RemoteDesk.Tests/           # 自動化單元與整合測試
-│       ├── CryptoAndChannelTests.cs
-│       ├── EndToEndLoopbackTests.cs
-│       ├── FrameEncoderDecoderTests.cs
-│       ├── ImeStateTests.cs
-│       ├── LanDiscoveryTests.cs
-│       ├── MonitorTests.cs
-│       ├── ProtocolTests.cs
-│       └── UiComponentTests.cs
-├── RemoteDesk.sln                  # Visual Studio 解決方案檔
-└── README.md                       # 專案說明與操作手冊
-```
+---
 
-### 從原始碼編譯
+## 建置與執行指南
 
-若欲自原始碼進行編譯與開發，請先確認已安裝 [.NET 9.0 SDK](https://dotnet.microsoft.com/download/dotnet/9.0)。
-
-```powershell
-# 1. 複製專案
-git clone https://github.com/ItingLai/RemoteDesk.git
-cd RemoteDesk
-
-# 2. 建置解決方案
+### 1. 從原始碼編譯與測試
+```bash
+# 還原並以 Release 模式建置完整方案
 dotnet build RemoteDesk.sln -c Release
 
-# 3. 執行單元測試
-dotnet test
+# 執行單元與回歸測試
+dotnet test RemoteDesk.sln -c Release
 
-# 4. 發行 Framework-dependent 執行檔
-dotnet publish src\RemoteDesk\RemoteDesk.csproj -c Release -r win-x64 --self-contained false -o publish
+# 啟動應用程式
+dotnet run --project src/RemoteDesk/RemoteDesk.csproj -c Release
 ```
 
-### 建置 WiX 安裝檔
-
-需安裝 WiX Toolset v4 或 v5（可透過 `dotnet tool install --global wix` 安裝）：
-
+### 2. 產出發行執行檔與 Windows 安裝檔
+執行自動化 WiX Toolset 打包腳本，將自動發布 `RemoteDesk.exe` 並編譯產出 **`dist/RemoteDesk.msi`** 與 **`dist/RemoteDeskSetup.exe`**（內建 .NET 9 Desktop Runtime x64 檢測與線上下載安裝流程）：
 ```powershell
-# 執行自動化建置指令檔，產出位於 dist/ 目錄
-powershell -ExecutionPolicy Bypass -File installer\build-installer.ps1
+powershell -ExecutionPolicy Bypass -File .\installer\build-installer.ps1
 ```
 
-產出結果：
-- `dist/RemoteDesk.msi`
-- `dist/RemoteDeskSetup.exe`
+### 3. 命令列引數 (CLI Arguments)
+應用程式支援透過命令列參數快速連線或建立獨立設定檔：
+```text
+--connect <ID/IP>    啟動後自動嘗試連線至指定 9 位數裝置 ID 或 IP(:Port)
+--profile <名稱>     使用獨立設定檔目錄 (DataDirectory) 與單實例鎖，便於多實例分開配置與測試
+--port <連接埠>      指定本機 TCP 監聽連接埠 (預設 21119)
+--help, -h           顯示命令列使用說明對話框
+```
 
 ---
 
-## 授權條款
+## 專案結構
 
-本專案採 MIT 授權條款釋出，詳情請參閱專案授權文件。
+```text
+RemoteDesk/
+├── RemoteDesk.sln                        # Visual Studio / .NET 方案檔
+├── installer/                            # WiX Toolset v4 安裝包建置腳本與定義
+│   ├── Bundle.wxs                        # Burn Bootstrapper (.NET 9 Desktop Runtime 檢測/安裝)
+│   ├── Package.wxs                       # MSI 安裝包元件與捷徑定義
+│   └── build-installer.ps1               # Release 發布與 MSI / Setup.exe 自動化建置腳本
+├── src/
+│   ├── RemoteDesk/                       # 主程式 (.NET 9 WinForms, x64)
+│   │   ├── Common/                       # 設定 (AppConfig)、協定、加密通道 (SecureChannel)、裝置識別、自適應解析度規則與單實例守護
+│   │   ├── Controls/                     # 深色主題自繪卡片與向量圖示元件
+│   │   ├── Host/                         # 受控端邏輯 (DXGI 擷取、FrameEncoder、自適應解析度、輸入模擬、存取核准)
+│   │   ├── Native/                       # Win32 P/Invoke 宣告 (Input, IMC/IME, DWM/DXGI)
+│   │   ├── Net/                          # LAN 探索、SignalingClient (DoH)、Multi-NIC/STUN、ICE 打洞、ReliableUdpStream、P2PPathMonitor
+│   │   ├── Viewer/                       # 控制端視窗、桌面畫布、FrameDecoder、KeyboardHook、IME 同步
+│   │   ├── MainForm.cs                   # 主控面板 (裝置 ID、遠端連線、收藏／最近設備在線狀態與系統匣)
+│   │   ├── ConnectionHistoryForm.cs      # 連線紀錄檢視視窗
+│   │   ├── SettingsForm.cs               # 本機設定 (無人值守密碼、畫質／解析度模式、VPN 候選策略)
+│   │   └── Program.cs                    # 程式進入點與 CLI 參數解析
+│   └── RemoteDesk.Installer/             # 獨立圖形化安裝程式引擎專案
+└── tests/
+    └── RemoteDesk.Tests/                 # xUnit 測試專案 (涵蓋協定、加解密、Multi-NIC、STUN/ICE、ReliableUDP 與編解碼回歸測試)
+```
+
+---
+
+## 安裝包與執行檔說明
+
+* **`RemoteDeskSetup.exe`**（推薦）：WiX Burn 安裝引導程式，會自動檢測目標電腦是否已安裝 Microsoft .NET 9 Desktop Runtime (x64)，若尚未安裝將自動下載官方執行環境並靜默安裝，隨後完成 RemoteDesk 主程式部署。
+* **`RemoteDesk.msi`**：純 Windows Installer 安裝套件，適用於已具備 .NET 9 Desktop Runtime (x64) 之環境直接安裝或企業批次佈署。
+
+---
+
+## 疑難排解
+
+* **跨外網 P2P 連線失敗或耗時過長**：
+  * 若雙端均位於嚴格對稱型 NAT（Symmetric NAT）或企業級 UDP 封鎖防火牆環境，純 P2P UDP 打洞可能受限，建議確認路由器啟用 UDP NAT 穿透或放行出站 UDP 流量。
+  * 若環境啟用多個 VPN 虛擬介面影響候選配對，可於「設定」中調整 **VPN 候選介面策略**（自動 / 排除）。
+* **畫面擷取異常或全黑**：
+  * 當處於多 GPU 環境或 UAC 權限提示畫面切換時，DXGI 可能觸發暫時性裝置中斷；程式內建自動切換與 GDI 備援擷取機制可維持連線。如遇完全黑屏，請確認未於受控端鎖定螢幕且遠端服務以適當權限運行。
+* **區域網路無法發現裝置**：
+  * 確認雙端皆連入同一區域網路子網，且 Windows 防火牆允許 TCP Port `21119`（資料傳輸）及 UDP Port `21118`（區域廣播探索）。

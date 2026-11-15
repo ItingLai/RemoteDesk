@@ -1,5 +1,6 @@
 using RemoteDesk.Common;
 using RemoteDesk.Host;
+using RemoteDesk.Native;
 using RemoteDesk.Net;
 using RemoteDesk.Viewer;
 
@@ -18,6 +19,9 @@ internal static class Program
         catch { }
 
         ApplicationConfiguration.Initialize();
+
+        string? profile = null;
+        int? customPort = null;
 
         // 檢查命令列參數
         if (args.Length > 0)
@@ -40,21 +44,15 @@ internal static class Program
             int profileIdx = Array.IndexOf(args, "--profile");
             if (profileIdx >= 0 && profileIdx + 1 < args.Length)
             {
-                string profile = args[profileIdx + 1];
+                profile = args[profileIdx + 1];
                 var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "RemoteDesk", "Profiles", profile);
                 AppConfig.OverrideDataDirectory(dir);
             }
 
             int portIdx = Array.IndexOf(args, "--port");
-            if (portIdx >= 0 && portIdx + 1 < args.Length && int.TryParse(args[portIdx + 1], out int customPort))
+            if (portIdx >= 0 && portIdx + 1 < args.Length && int.TryParse(args[portIdx + 1], out int parsedPort))
             {
-                var hostCfg = HostConfig.Load();
-                hostCfg.TcpPort = customPort;
-                if (profileIdx >= 0 && profileIdx + 1 < args.Length)
-                {
-                    hostCfg.DeviceName = $"{Environment.MachineName} [{args[profileIdx + 1]}]";
-                }
-                hostCfg.TrySave();
+                customPort = parsedPort;
             }
 
             int connectIdx = Array.IndexOf(args, "--connect");
@@ -62,8 +60,8 @@ internal static class Program
             {
                 string target = args[connectIdx + 1];
                 var viewerCfg = ViewerConfig.Load();
-                var hostCfg = HostConfig.Load();
-                var discovery = new LanDiscovery(hostCfg.DeviceId);
+                var hostCfgForViewer = HostConfig.Load();
+                var discovery = new LanDiscovery(hostCfgForViewer.DeviceId);
                 discovery.Start();
 
                 var session = new ViewerSession(target, viewerCfg, discovery);
@@ -83,7 +81,72 @@ internal static class Program
             }
         }
 
+        // 先載入既有 HostConfig 以取得穩定的 DeviceId，再進行單一主程式實例鎖定（避免雙開互搶同一 DeviceId 與 Signaling 工作階段）
+        var initialHostCfg = HostConfig.Load();
+        using var singleInstance = SingleInstanceGuard.TryAcquire(profile, initialHostCfg.DeviceId);
+        if (singleInstance == null)
+        {
+            Log.Info($"[Startup] 偵測到相同 Profile/DeviceId 主程式實例已在執行，略過重複啟動 (Profile={profile ?? "default"}, DeviceId={initialHostCfg.DeviceId})。");
+            bool activated = SingleInstanceGuard.NotifyExistingInstance(profile, initialHostCfg.DeviceId);
+            if (!activated)
+            {
+                MessageBox.Show(
+                    $"RemoteDesk 已在執行中（裝置 ID：{AppConfig.FormatId(initialHostCfg.DeviceId)}）。\n為避免重複註冊與工作階段競爭，同一裝置 ID 僅允許一個主程式實例。",
+                    "RemoteDesk 已在執行",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+            return;
+        }
+
+        Log.Info($"[Startup] 已取得單一主程式實例鎖 (Profile={profile ?? "default"}, DeviceId={initialHostCfg.DeviceId}, Mutex={singleInstance.MutexName})。");
+
+        if (customPort.HasValue)
+        {
+            initialHostCfg.TcpPort = customPort.Value;
+            if (!string.IsNullOrEmpty(profile))
+            {
+                initialHostCfg.DeviceName = $"{Environment.MachineName} [{profile}]";
+            }
+            initialHostCfg.TrySave();
+        }
+
         // 預設啟動完整圖形主介面 (包含被控服務與控制端功能)
-        Application.Run(new MainForm());
+        using var mainForm = new MainForm();
+        RegisteredWaitHandle? waitHandle = ThreadPool.RegisterWaitForSingleObject(
+            singleInstance.ActivationEvent,
+            static (state, timedOut) =>
+            {
+                if (timedOut || state is not Form form || form.IsDisposed) return;
+                try
+                {
+                    if (!form.IsHandleCreated) return;
+                    form.BeginInvoke(() =>
+                    {
+                        if (form.IsDisposed) return;
+                        if (form.WindowState == FormWindowState.Minimized)
+                        {
+                            form.WindowState = FormWindowState.Normal;
+                        }
+                        form.Show();
+                        form.Activate();
+                        form.BringToFront();
+                        Win32.SetForegroundWindow(form.Handle);
+                    });
+                }
+                catch { }
+            },
+            mainForm,
+            Timeout.Infinite,
+            executeOnlyOnce: false);
+
+        try
+        {
+            Application.Run(mainForm);
+        }
+        finally
+        {
+            waitHandle?.Unregister(null);
+        }
     }
 }

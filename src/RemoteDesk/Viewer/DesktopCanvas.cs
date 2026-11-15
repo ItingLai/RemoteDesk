@@ -14,6 +14,7 @@ internal sealed class DesktopCanvas : Control
     private bool _fitToWindow = true;
     private Rectangle _destRect;
     private int _lastMouseX = -1, _lastMouseY = -1;
+    private long _lastRenderedFrameVersion;
 
     public bool FitToWindow
     {
@@ -43,8 +44,8 @@ internal sealed class DesktopCanvas : Control
 
     public void RecalculateLayout()
     {
-        int rw = _session.RemoteWidth;
-        int rh = _session.RemoteHeight;
+        int rw = _session.OriginalWidth > 0 ? _session.OriginalWidth : _session.StreamWidth;
+        int rh = _session.OriginalHeight > 0 ? _session.OriginalHeight : _session.StreamHeight;
         if (rw <= 0 || rh <= 0 || ClientSize.Width <= 0 || ClientSize.Height <= 0)
         {
             _destRect = Rectangle.Empty;
@@ -79,10 +80,50 @@ internal sealed class DesktopCanvas : Control
         Invalidate();
     }
 
+    /// <summary>
+    /// 依據遠端變動矩形 (Dirty Rectangle) 局部重繪畫布，避免全螢幕重畫造成的 GDI+ UI 執行緒卡頓。
+    /// </summary>
+    public void InvalidateRemoteRect(Rectangle remoteRect)
+    {
+        if (remoteRect.IsEmpty) return;
+        int sw = _session.StreamWidth;
+        int sh = _session.StreamHeight;
+        if (_destRect.IsEmpty || sw <= 0 || sh <= 0)
+        {
+            Invalidate();
+            return;
+        }
+
+        if (remoteRect.Width >= sw && remoteRect.Height >= sh)
+        {
+            Invalidate(_destRect);
+            return;
+        }
+
+        // 映射串流解析度座標 (StreamWidth × StreamHeight) 至本機 Client 顯示矩形
+        float scaleX = (float)_destRect.Width / sw;
+        float scaleY = (float)_destRect.Height / sh;
+
+        int cx = _destRect.X + (int)Math.Floor(remoteRect.X * scaleX);
+        int cy = _destRect.Y + (int)Math.Floor(remoteRect.Y * scaleY);
+        int cw = (int)Math.Ceiling(remoteRect.Width * scaleX) + 2; // +2 避免浮點數捨入造成的邊緣微小縫隙
+        int ch = (int)Math.Ceiling(remoteRect.Height * scaleY) + 2;
+
+        var clientDirty = Rectangle.Intersect(new Rectangle(cx, cy, cw, ch), _destRect);
+        if (!clientDirty.IsEmpty)
+        {
+            Invalidate(clientDirty);
+        }
+        else
+        {
+            Invalidate(_destRect);
+        }
+    }
+
     protected override void OnPaint(PaintEventArgs e)
     {
         var g = e.Graphics;
-        if (_destRect.IsEmpty || _session.RemoteWidth <= 0)
+        if (_destRect.IsEmpty || _session.StreamWidth <= 0)
         {
             g.Clear(Color.FromArgb(24, 24, 24));
             using var font = new Font("Microsoft JhengHei UI", 12f, FontStyle.Regular);
@@ -93,32 +134,53 @@ internal sealed class DesktopCanvas : Control
             return;
         }
 
-        // 繪製黑底留白邊界
-        if (_destRect.X > 0 || _destRect.Y > 0 || _destRect.Right < ClientSize.Width || _destRect.Bottom < ClientSize.Height)
+        // 只有當重繪區域跨出 _destRect (有黑色邊框留白) 時才清除黑底邊界
+        if (!_destRect.Contains(e.ClipRectangle))
         {
-            g.Clear(Color.FromArgb(20, 20, 20));
+            if (_destRect.X > 0 || _destRect.Y > 0 || _destRect.Right < ClientSize.Width || _destRect.Bottom < ClientSize.Height)
+            {
+                g.Clear(Color.FromArgb(20, 20, 20));
+            }
         }
 
-        // 繪製遠端影像
-        _session.Decoder.DrawTo(g, _destRect);
+        // 繪製遠端影像 (GDI+ 自動根據 e.ClipRectangle 裁剪，僅 Blit 局部變更區域，並量測真實 UI 渲染耗時)
+        RenderFrameForPaint(g);
     }
 
     /// <summary>
-    /// 將本機滑鼠座標轉換為遠端螢幕真實像素座標。
+    /// 實際繪製影像並依最新解碼影格版本去重回報渲染事件，
+    /// 避免無新影格的 WM_PAINT (移動視窗/滑過/遮蔽重繪) 被誤算為 RenderFps。
+    /// </summary>
+    internal bool RenderFrameForPaint(Graphics g)
+    {
+        if (_destRect.IsEmpty || _session.StreamWidth <= 0) return false;
+
+        long decodedVer = _session.CurrentDecodedFrameVersion;
+        var renderSw = System.Diagnostics.Stopwatch.StartNew();
+        _session.Decoder.DrawTo(g, _destRect);
+        renderSw.Stop();
+
+        if (decodedVer > _lastRenderedFrameVersion)
+        {
+            _lastRenderedFrameVersion = decodedVer;
+            _session.ReportFrameRendered(renderSw.Elapsed.TotalMilliseconds, decodedVer);
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 將本機滑鼠座標轉換為被控端原始原生解析度座標（Strict decoupling from StreamWidth/Height）。
     /// </summary>
     private bool TryMapToRemote(int clientX, int clientY, out int remoteX, out int remoteY)
     {
-        remoteX = 0; remoteY = 0;
-        if (_destRect.IsEmpty || _destRect.Width <= 0 || _destRect.Height <= 0) return false;
-        if (!_destRect.Contains(clientX, clientY)) return false;
-
-        float ratioX = (float)_session.RemoteWidth / _destRect.Width;
-        float ratioY = (float)_session.RemoteHeight / _destRect.Height;
-
-        remoteX = Math.Clamp((int)((clientX - _destRect.X) * ratioX), 0, _session.RemoteWidth - 1);
-        remoteY = Math.Clamp((int)((clientY - _destRect.Y) * ratioY), 0, _session.RemoteHeight - 1);
-        return true;
+        int origW = _session.OriginalWidth > 0 ? _session.OriginalWidth : _session.RemoteWidth;
+        int origH = _session.OriginalHeight > 0 ? _session.OriginalHeight : _session.RemoteHeight;
+        return ResolutionProfileManager.TryMapViewerPointToHostOriginal(
+            clientX, clientY, _destRect, origW, origH, out remoteX, out remoteY);
     }
+
+    private long _lastMouseMoveTime;
 
     protected override void OnMouseMove(MouseEventArgs e)
     {
@@ -127,9 +189,14 @@ internal sealed class DesktopCanvas : Control
         {
             if (rx != _lastMouseX || ry != _lastMouseY)
             {
-                _lastMouseX = rx;
-                _lastMouseY = ry;
-                _session.SendMouseMove(rx, ry);
+                long now = Environment.TickCount64;
+                if (now - _lastMouseMoveTime >= 12) // 限速最高 ~80 Hz，防電競滑鼠高回報率 (500~1000Hz) 阻塞 UDP 頻道
+                {
+                    _lastMouseMoveTime = now;
+                    _lastMouseX = rx;
+                    _lastMouseY = ry;
+                    _session.SendMouseMove(rx, ry);
+                }
             }
         }
     }
@@ -140,6 +207,9 @@ internal sealed class DesktopCanvas : Control
         Focus();
         if (TryMapToRemote(e.X, e.Y, out int rx, out int ry))
         {
+            _lastMouseX = rx;
+            _lastMouseY = ry;
+            _session.SendMouseMove(rx, ry);
             var btn = MapButton(e.Button);
             if (btn.HasValue) _session.SendMouseButton(btn.Value, true, rx, ry);
         }

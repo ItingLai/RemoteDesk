@@ -37,7 +37,7 @@ namespace RemoteDesk;
 /// │  │ 123 456 789  │  │ 987 654 321  │  │ 456 789 123  │       │
 /// │  └──────────────┘  └──────────────┘  └──────────────┘       │
 /// ├──────────────────────────────────────────────────────────────┤
-/// │ ● Server Status: Online                 Version: 1.0.1      │
+/// │ ● Server Status: Online                 Version: 2.0.0      │
 /// └──────────────────────────────────────────────────────────────┘
 /// </summary>
 internal sealed class MainForm : Form, IHostUi
@@ -46,6 +46,7 @@ internal sealed class MainForm : Form, IHostUi
     private readonly ViewerConfig _viewerConfig;
     private readonly LanDiscovery _discovery;
     private readonly HostServer _server;
+    private SignalingClient? _signalingClient;
 
     // ---------------- 1. 頂部區域 (AppHeader / Custom Window Chrome - 規格 4.3) ----------------
     private Panel _pnlHeader = null!;
@@ -212,16 +213,31 @@ internal sealed class MainForm : Form, IHostUi
     }
 
     private System.Windows.Forms.Timer? _deviceRefreshTimer;
+    private readonly DeviceOnlineStatusTracker _statusTracker = new();
+    private CancellationTokenSource _statusPollCts = new();
+    private DateTime _lastRemoteStatusPollUtc = DateTime.MinValue;
+    private int _remotePollInFlight;
 
     protected override void OnLoad(EventArgs e)
     {
         base.OnLoad(e);
 
         _discovery.Start();
-        _discovery.DeviceUpdated += _ => BeginInvoke(() => { if (!IsDisposed) RefreshDeviceCards(); });
+        _discovery.DeviceUpdated += d =>
+        {
+            _statusTracker.OnLanDeviceUpdated(d);
+            BeginInvoke(() => { if (!IsDisposed) RefreshDeviceCards(); });
+        };
 
         _deviceRefreshTimer = new System.Windows.Forms.Timer { Interval = 5000 };
-        _deviceRefreshTimer.Tick += (_, _) => { if (!IsDisposed && _pnlHomeView.Visible) RefreshDeviceCards(); };
+        _deviceRefreshTimer.Tick += (_, _) =>
+        {
+            if (!IsDisposed && _pnlHomeView.Visible)
+            {
+                RefreshDeviceCards();
+                TriggerRemoteStatusRefreshIfDue(TimeSpan.FromSeconds(10));
+            }
+        };
         _deviceRefreshTimer.Start();
 
         try
@@ -232,6 +248,8 @@ internal sealed class MainForm : Form, IHostUi
         {
             MessageBox.Show(this, $"啟動被控服務失敗：{ex.Message}\n本機仍可作為控制端連線至其他電腦。", "服務提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
+
+        InitSignalingClient();
 
         Task.Run(() =>
         {
@@ -610,7 +628,7 @@ internal sealed class MainForm : Form, IHostUi
             Cursor = Cursors.Default
         };
 
-        // 連線品質與延遲標籤 (點擊或 Hover 顯示即時延遲、FPS、解析度、Port)
+        // 連線延遲徽章 (僅面向使用者顯示延遲數值，詳細連線品質與診斷資訊記錄於系統 Log)
         _lblSessionStatusBadge = new Label
         {
             Text = "● 0ms",
@@ -620,24 +638,9 @@ internal sealed class MainForm : Form, IHostUi
             Padding = new Padding(6, 2, 6, 2),
             AutoSize = true,
             Visible = false,
-            Cursor = Cursors.Hand
+            Cursor = Cursors.Default
         };
-        _lblSessionStatusBadge.MouseEnter += (_, _) =>
-        {
-            if (_currentSession != null) UpdateSessionMetrics(_currentSession);
-        };
-        _lblSessionStatusBadge.Click += (_, _) =>
-        {
-            if (_currentSession != null)
-            {
-                UpdateSessionMetrics(_currentSession);
-                string? tip = _sessionToolTip.GetToolTip(_lblSessionStatusBadge);
-                if (!string.IsNullOrEmpty(tip))
-                {
-                    _sessionToolTip.Show(tip, _lblSessionStatusBadge, 0, _lblSessionStatusBadge.Height + 4, 6000);
-                }
-            }
-        };
+        _sessionToolTip.SetToolTip(_lblSessionStatusBadge, "目前連線延遲");
 
         // 頂部多工作階段標籤列 (連線時動態顯示)
         _pnlHeaderTabs = new FlowLayoutPanel
@@ -1464,6 +1467,7 @@ internal sealed class MainForm : Form, IHostUi
 
         _inputRemoteAddress.FocusInput();
         RefreshDeviceCards();
+        TriggerRemoteStatusRefreshIfDue(TimeSpan.FromSeconds(3));
     }
 
     private void SwitchToSessionTab(SessionTabItem item)
@@ -1499,22 +1503,16 @@ internal sealed class MainForm : Form, IHostUi
 
     private void UpdateSessionMetrics(SessionTabItem item)
     {
-        string qualityName = _viewerConfig.Quality >= 80 ? "高品質 (90%)" : (_viewerConfig.Quality >= 65 ? "標準 (70%)" : "極速 (50%)");
-        string statusText = item.Session.CurrentRttMs < 50 ? "良好 (流暢)" : (item.Session.CurrentRttMs < 100 ? "普通" : "延遲較高");
-        string metricsText = 
-            $"【遠端連線品質與效能資訊】\n" +
-            $"• 往返延遲 (RTT)：{item.Session.CurrentRttMs} ms\n" +
-            $"• 畫面更新率 (FPS)：{item.Fps} FPS\n" +
-            $"• 畫面編碼品質：{qualityName}\n" +
-            $"• 遠端螢幕解析度：{item.Session.RemoteWidth} × {item.Session.RemoteHeight}\n" +
-            $"• 傳輸連接埠：Port {_hostConfig.TcpPort}\n" +
-            $"• 網路狀態：{statusText}\n\n" +
-            $"※ 點擊此按鈕可即時重新整理診斷資訊";
+        var t = item.Session.CurrentTelemetry;
+        int displayRtt = t != null
+            ? Math.Max(0, (int)Math.Round(t.RttMs > 0 ? t.RttMs : item.Session.CurrentRttMs))
+            : Math.Max(0, item.Session.CurrentRttMs);
 
-        _lblSessionStatusBadge.Text = $"● {item.Session.CurrentRttMs}ms";
-        _lblSessionStatusBadge.ForeColor = item.Session.CurrentRttMs < 50 ? Theme.Success : (item.Session.CurrentRttMs < 100 ? Theme.Warning : Theme.Danger);
-        _sessionToolTip.SetToolTip(_lblSessionStatusBadge, metricsText);
-        _sessionToolTip.SetToolTip(_lblSessionTitle, metricsText);
+        // 僅對使用者顯示延遲數值；解析度、FPS、頻寬、傳輸模式與品質統計只寫入系統 Log
+        _lblSessionStatusBadge.Text = $"● {displayRtt}ms";
+        _lblSessionStatusBadge.ForeColor = displayRtt < 50 ? Theme.Success : (displayRtt < 100 ? Theme.Warning : Theme.Danger);
+        _sessionToolTip.SetToolTip(_lblSessionStatusBadge, $"目前連線延遲：{displayRtt} ms");
+        _sessionToolTip.SetToolTip(_lblSessionTitle, string.Empty);
     }
 
     private void UpdateRemoteControlsBar(SessionTabItem item)
@@ -1656,6 +1654,10 @@ internal sealed class MainForm : Form, IHostUi
         else
         {
             UpdateHeaderLayout();
+            if (_pnlHomeView.Visible)
+            {
+                RefreshDeviceCards();
+            }
         }
     }
 
@@ -1687,8 +1689,59 @@ internal sealed class MainForm : Form, IHostUi
         {
             RefreshDeviceCards();
             UpdateLocalNetworkInfo();
-        });
+            InitSignalingClient();
+            foreach (var tab in _sessionTabs)
+            {
+                tab.Canvas.FitToWindow = _viewerConfig.FitToWindow;
+                tab.Session.SendVideoSettings(
+                    _viewerConfig.Quality,
+                    _viewerConfig.MaxFps,
+                    _viewerConfig.Lossless,
+                    _viewerConfig.ResolutionMode);
+            }
+            if (_currentSession != null)
+            {
+                UpdateSessionMetrics(_currentSession);
+            }
+        }, _server.TrustStore, _server.Identity);
         dlg.ShowDialog(this);
+    }
+
+    private void InitSignalingClient()
+    {
+        _signalingClient?.Dispose();
+        _signalingClient = null;
+        if (!string.IsNullOrWhiteSpace(_hostConfig.SignalingServerUrl))
+        {
+            _signalingClient = new SignalingClient(_hostConfig.SignalingServerUrl, _server.Identity)
+            {
+                TcpPort = _hostConfig.TcpPort
+            };
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    bool registered = await _signalingClient.RegisterAsync().ConfigureAwait(false);
+                    if (!registered)
+                    {
+                        await Task.Delay(1500).ConfigureAwait(false);
+                        await _signalingClient.RegisterAsync().ConfigureAwait(false);
+                    }
+                    _signalingClient.StartHeartbeatLoop();
+                    _server.SetSignalingClient(_signalingClient);
+                }
+                catch (Exception ex)
+                {
+                    Log.Warn($"無法註冊至 Signaling Server: {ex.Message}");
+                }
+            });
+        }
+        else
+        {
+            _server.SetSignalingClient(null);
+        }
+
+        TriggerRemoteStatusRefreshIfDue(TimeSpan.Zero);
     }
 
     private void OpenHistoryDialog()
@@ -1710,21 +1763,140 @@ internal sealed class MainForm : Form, IHostUi
         _sessionToolTip.SetToolTip(_lblMyStatus, info);
     }
 
+    internal DeviceOnlineStatusTracker StatusTrackerForTest => _statusTracker;
+    internal ViewerConfig ViewerConfigForTest => _viewerConfig;
+    internal void SetSignalingClientForTest(SignalingClient? client)
+    {
+        if (!ReferenceEquals(_signalingClient, client))
+        {
+            _signalingClient?.Dispose();
+            _signalingClient = client;
+        }
+    }
+    internal void RefreshDeviceCardsForTest() => RefreshDeviceCards();
+    internal IReadOnlyList<DeviceThumbnailCard> GetVisibleDeviceCardsForTest() =>
+        _pnlDevicesGrid.Controls.OfType<DeviceThumbnailCard>().ToList();
+
+    internal async Task<bool> RefreshRemoteDeviceStatusesOnceForTestAsync(CancellationToken ct = default)
+    {
+        var entries = BuildTrackedEntriesSnapshot();
+        var lanDevices = _discovery.Devices;
+        bool changed = await _statusTracker.RefreshRemoteStatusesAsync(
+            _signalingClient, entries, lanDevices, _hostConfig.DeviceId, ct: ct).ConfigureAwait(false);
+        if (!IsDisposed && IsHandleCreated)
+        {
+            void UpdateUi()
+            {
+                if (!IsDisposed) RefreshDeviceCards();
+            }
+            if (InvokeRequired) Invoke(UpdateUi);
+            else UpdateUi();
+        }
+        return changed;
+    }
+
+    private List<RecentEntry> BuildTrackedEntriesSnapshot() =>
+        _viewerConfig.GetRecent()
+            .Concat(_viewerConfig.GetFavorites())
+            .Select(e => new RecentEntry
+            {
+                Key = e.Key,
+                DeviceId = e.DeviceId,
+                LastAddress = e.LastAddress
+            })
+            .ToList();
+
+    private void TriggerRemoteStatusRefreshIfDue(TimeSpan minInterval)
+    {
+        if (IsDisposed || _statusPollCts.IsCancellationRequested) return;
+
+        DateTime nowUtc = DateTime.UtcNow;
+        if (nowUtc - _lastRemoteStatusPollUtc < minInterval) return;
+
+        var client = _signalingClient;
+        var entries = BuildTrackedEntriesSnapshot();
+        if (client != null && entries.Count == 0) return;
+
+        if (Interlocked.CompareExchange(ref _remotePollInFlight, 1, 0) != 0) return;
+        _lastRemoteStatusPollUtc = nowUtc;
+
+        var lanDevices = _discovery.Devices;
+        var ct = _statusPollCts.Token;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                bool changed = await _statusTracker.RefreshRemoteStatusesAsync(
+                    client, entries, lanDevices, _hostConfig.DeviceId, ct: ct).ConfigureAwait(false);
+                if (changed && !IsDisposed && IsHandleCreated)
+                {
+                    BeginInvoke(() =>
+                    {
+                        if (!IsDisposed && _pnlHomeView.Visible) RefreshDeviceCards();
+                    });
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                Log.Warn($"[MainForm] 背景更新遠端設備在線狀態失敗: {ex.Message}");
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _remotePollInFlight, 0);
+            }
+        });
+    }
+
+    private bool IsEntryInActiveSession(RecentEntry entry) =>
+        _sessionTabs.Any(s =>
+            s.Session.IsConnected &&
+            (string.Equals(s.Key, entry.Key, StringComparison.OrdinalIgnoreCase) ||
+             (!string.IsNullOrEmpty(entry.DeviceId) &&
+              (string.Equals(s.Session.HostDeviceId, entry.DeviceId, StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(s.Key, entry.DeviceId, StringComparison.OrdinalIgnoreCase))) ||
+             (!string.IsNullOrEmpty(entry.LastAddress) &&
+              string.Equals(s.Key, entry.LastAddress, StringComparison.OrdinalIgnoreCase))));
+
+    private static bool CanUpdateCardsInPlace(Control.ControlCollection controls, IReadOnlyList<DeviceThumbnailCard> existingCards, IReadOnlyList<RecentEntry> entries)
+    {
+        if (entries.Count == 0 || existingCards.Count != entries.Count || controls.Count != existingCards.Count)
+        {
+            return false;
+        }
+        for (int i = 0; i < entries.Count; i++)
+        {
+            if (!existingCards[i].MatchesRenderedState(entries[i])) return false;
+        }
+        return true;
+    }
+
+    private void ClearDeviceCardsAndDispose()
+    {
+        var oldCards = _pnlDevicesGrid.Controls.OfType<DeviceThumbnailCard>().ToList();
+        _pnlDevicesGrid.Controls.Clear();
+        foreach (var card in oldCards)
+        {
+            card.Dispose();
+        }
+    }
+
     private void RefreshDeviceCards()
     {
         var recent = _viewerConfig.GetRecent();
         var favs = _viewerConfig.GetFavorites();
 
-        var lanDiscovered = _discovery.Devices
-            .Where(d => !NetworkHelper.IsSelfTarget(d.Id, _hostConfig.DeviceId, _viewerConfig.ViewerId) &&
+        var allLanDevices = _discovery.Devices;
+        var lanDiscovered = allLanDevices
+            .Where(d => d.LastSeen != DateTime.MinValue &&
+                        !NetworkHelper.IsSelfTarget(d.Id, _hostConfig.DeviceId, _viewerConfig.ViewerId) &&
                         !NetworkHelper.IsSelfTarget(d.Address.ToString(), _hostConfig.DeviceId, _viewerConfig.ViewerId) &&
                         (DateTime.Now - d.LastSeen < TimeSpan.FromSeconds(30)))
             .OrderByDescending(d => d.LastSeen)
             .ToList();
 
         _tabsDevices.UpdateCounts(recent.Count, favs.Count, lanDiscovered.Count);
-
-        _pnlDevicesGrid.Controls.Clear();
 
         List<RecentEntry> list;
         if (_tabsDevices.SelectedIndex == 0)
@@ -1768,48 +1940,80 @@ internal sealed class MainForm : Form, IHostUi
                 1 => "尚無我的最愛設備。可在連線紀錄或區域網設備卡片上按右鍵加入我的最愛。",
                 _ => "區域網路內目前未發現其他 RemoteDesk 設備。\n請確認其他電腦已開啟 RemoteDesk 並連上同一網路。"
             };
-            _lblDevicesEmpty.Visible = true;
-            _pnlDevicesGrid.Controls.Add(_lblDevicesEmpty);
+            if (!_pnlDevicesGrid.Controls.Contains(_lblDevicesEmpty) || _pnlDevicesGrid.Controls.Count != 1)
+            {
+                ClearDeviceCardsAndDispose();
+                _lblDevicesEmpty.Visible = true;
+                _pnlDevicesGrid.Controls.Add(_lblDevicesEmpty);
+            }
+            else
+            {
+                _lblDevicesEmpty.Visible = true;
+            }
             return;
         }
 
-        _lblDevicesEmpty.Visible = false;
-        foreach (var entry in list)
-        {
-            bool isOnline = _sessionTabs.Any(s => s.Key == entry.Key || (!string.IsNullOrEmpty(entry.DeviceId) && s.Session.HostDeviceId == entry.DeviceId))
-                || _discovery.Devices.Any(d =>
-                    ((!string.IsNullOrEmpty(entry.DeviceId) && d.Id == entry.DeviceId) ||
-                     d.Id == entry.Key ||
-                     d.Address.ToString() == entry.Key ||
-                     d.EndPoint.ToString() == entry.Key)
-                    && (DateTime.Now - d.LastSeen < TimeSpan.FromSeconds(25)));
-
-            var card = new DeviceThumbnailCard(
+        DateTime nowLocal = DateTime.Now;
+        DateTime nowUtc = DateTime.UtcNow;
+        var statuses = list
+            .Select(entry => _statusTracker.IsDeviceOnline(
                 entry,
-                isOnline,
-                id => DoConnect(id),
-                key =>
-                {
-                    _viewerConfig.ToggleFavorite(key);
-                    RefreshDeviceCards();
-                },
-                key =>
-                {
-                    _viewerConfig.RemoveRecent(key);
-                    RefreshDeviceCards();
-                },
-                (key, newName) =>
-                {
-                    var item = _viewerConfig.Recent.FirstOrDefault(x => x.Key == key || x.DeviceId == key);
-                    if (item != null)
-                    {
-                        item.Name = string.IsNullOrWhiteSpace(newName) ? null : newName.Trim();
-                        _viewerConfig.Save();
-                        RefreshDeviceCards();
-                    }
-                });
+                IsEntryInActiveSession(entry),
+                allLanDevices,
+                _hostConfig.DeviceId,
+                nowLocal,
+                nowUtc))
+            .ToArray();
 
-            _pnlDevicesGrid.Controls.Add(card);
+        var existingCards = _pnlDevicesGrid.Controls.OfType<DeviceThumbnailCard>().ToList();
+        if (CanUpdateCardsInPlace(_pnlDevicesGrid.Controls, existingCards, list))
+        {
+            for (int i = 0; i < existingCards.Count; i++)
+            {
+                existingCards[i].IsOnline = statuses[i];
+            }
+            return;
+        }
+
+        _pnlDevicesGrid.SuspendLayout();
+        try
+        {
+            ClearDeviceCardsAndDispose();
+            _lblDevicesEmpty.Visible = false;
+            for (int i = 0; i < list.Count; i++)
+            {
+                var entry = list[i];
+                var card = new DeviceThumbnailCard(
+                    entry,
+                    statuses[i],
+                    id => DoConnect(id),
+                    key =>
+                    {
+                        _viewerConfig.ToggleFavorite(key);
+                        RefreshDeviceCards();
+                    },
+                    key =>
+                    {
+                        _viewerConfig.RemoveRecent(key);
+                        RefreshDeviceCards();
+                    },
+                    (key, newName) =>
+                    {
+                        var item = _viewerConfig.Recent.FirstOrDefault(x => x.Key == key || x.DeviceId == key);
+                        if (item != null)
+                        {
+                            item.Name = string.IsNullOrWhiteSpace(newName) ? null : newName.Trim();
+                            _viewerConfig.Save();
+                            RefreshDeviceCards();
+                        }
+                    });
+
+                _pnlDevicesGrid.Controls.Add(card);
+            }
+        }
+        finally
+        {
+            _pnlDevicesGrid.ResumeLayout(true);
         }
     }
 
@@ -1852,11 +2056,51 @@ internal sealed class MainForm : Form, IHostUi
             while (true)
             {
                 session?.Dispose();
-                session = new ViewerSession(clean, _viewerConfig, _discovery, _hostConfig.DeviceId);
+                session = new ViewerSession(clean, _viewerConfig, _discovery, _hostConfig.DeviceId, identity: null, signalingClient: _signalingClient);
+
+                ConnectPasswordDialog? activePwdDlg = null;
+                session.PasswordPromptHandler = ctx =>
+                {
+                    var tcs = new TaskCompletionSource();
+                    BeginInvoke(() =>
+                    {
+                        string hostDisplayName = !string.IsNullOrEmpty(ctx.HostDisplayName) ? ctx.HostDisplayName : clean;
+                        activePwdDlg = new ConnectPasswordDialog(hostDisplayName, ctx.HostDeviceId, prefilledPassword: null, allowInteractive: false, errorMessage: ctx.InitialError);
+
+                        ctx.CloseDialogOnRemoteAccepted = () =>
+                        {
+                            activePwdDlg?.RemoteAccepted();
+                        };
+
+                        ctx.ShowErrorMessage = err =>
+                        {
+                            activePwdDlg?.SetErrorMessage(err);
+                        };
+
+                        activePwdDlg.PasswordSubmitted += async (enteredPwd, remember) =>
+                        {
+                            await ctx.SubmitPasswordAsync(enteredPwd, remember).ConfigureAwait(false);
+                        };
+
+                        activePwdDlg.FormClosed += (_, _) =>
+                        {
+                            if (activePwdDlg != null && !activePwdDlg.WasRemoteAccepted && activePwdDlg.DialogResult == DialogResult.Cancel)
+                            {
+                                _connectingCts?.Cancel();
+                            }
+                            activePwdDlg = null;
+                            tcs.TrySetResult();
+                        };
+
+                        activePwdDlg.Show(this);
+                    });
+                    return tcs.Task;
+                };
 
                 try
                 {
                     await session.ConnectAsync(pwd, token, forceInteractive).ConfigureAwait(true);
+                    activePwdDlg?.Close();
                     if (session.HostDeviceId == _hostConfig.DeviceId || session.HostDeviceId == _viewerConfig.ViewerId)
                     {
                         session.Dispose();
@@ -1868,49 +2112,53 @@ internal sealed class MainForm : Form, IHostUi
                 }
                 catch (UnauthorizedAccessException ex)
                 {
+                    activePwdDlg?.Close();
                     StopConnectingAnimation();
 
-                    bool isFirstPrompt = ex is NeedPasswordException;
-                    bool allowInteractive = ex is NeedPasswordException np && np.AllowInteractive;
-
-                    if (!isFirstPrompt)
+                    if (ex is NeedPasswordException np || ex.Message.Contains("密碼"))
                     {
-                        errorHint = "⚠️ 連線密碼錯誤，請重新輸入：";
-                    }
+                        string hostDisplayName = !string.IsNullOrEmpty(session.HostDeviceName)
+                            ? session.HostDeviceName
+                            : clean;
 
-                    string hostDisplayName = !string.IsNullOrEmpty(session.HostDeviceName)
-                        ? session.HostDeviceName
-                        : clean;
+                        errorHint = ex.Message;
 
-                    using var pwdDlg = new ConnectPasswordDialog(
-                        hostDisplayName,
-                        clean,
-                        pwd,
-                        allowInteractive,
-                        errorHint);
+                        using var pwdDlg = new ConnectPasswordDialog(
+                            hostDisplayName,
+                            clean,
+                            pwd,
+                            allowInteractive: false,
+                            errorHint);
 
-                    if (pwdDlg.ShowDialog(this) == DialogResult.OK)
-                    {
-                        forceInteractive = false;
-                        pwd = pwdDlg.Password;
-                        if (pwdDlg.RememberPassword)
+                        if (pwdDlg.ShowDialog(this) == DialogResult.OK)
                         {
-                            _viewerConfig.RememberPassword(clean, pwd);
-                            _viewerConfig.Save();
-                        }
+                            forceInteractive = false;
+                            pwd = pwdDlg.Password;
+                            if (pwdDlg.RememberPassword)
+                            {
+                                _viewerConfig.RememberPassword(clean, pwd);
+                                _viewerConfig.Save();
+                            }
+                            else
+                            {
+                                _viewerConfig.RememberPassword(clean, null);
+                                _viewerConfig.Save();
+                            }
 
-                        StartConnectingAnimation(clean);
+                            StartConnectingAnimation(clean);
+                            continue;
+                        }
                     }
-                    else
-                    {
-                        session.Dispose();
-                        return;
-                    }
+
+                    session.Dispose();
+                    MessageBox.Show(this, $"連線請求未被核准或已被拒絕：\n{ex.Message}", "連線未授權", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
                 }
             }
 
             // 連線成功，記錄到最近連線
-            _viewerConfig.TouchRecent(clean, session.HostDeviceId, session.HostDeviceName, null, Protocol.DefaultTcpPort);
+            string? directAddr = DeviceOnlineStatusTracker.IsValidDeviceId(clean) ? null : clean;
+            _viewerConfig.TouchRecent(clean, session.HostDeviceId, session.HostDeviceName, directAddr, Protocol.DefaultTcpPort);
             _viewerConfig.Save();
 
             // 建立畫布與輸入法客戶端
@@ -1950,6 +2198,34 @@ internal sealed class MainForm : Form, IHostUi
             _pnlHeaderTabs.Controls.Add(tabBtn);
 
             // 註冊 Session 事件
+            session.ResolutionChanged += (w, h) =>
+            {
+                BeginInvoke(() =>
+                {
+                    canvas.RecalculateLayout();
+                    canvas.Invalidate();
+                    if (_currentSession == tabItem) UpdateSessionMetrics(tabItem);
+                });
+            };
+
+            session.StreamConfigChanged += (origW, origH, streamW, streamH, level, mode, reason) =>
+            {
+                BeginInvoke(() =>
+                {
+                    canvas.RecalculateLayout();
+                    canvas.Invalidate();
+                    if (_currentSession == tabItem) UpdateSessionMetrics(tabItem);
+                });
+            };
+
+            session.TelemetryUpdated += _ =>
+            {
+                if (_currentSession == tabItem)
+                {
+                    BeginInvoke(() => UpdateSessionMetrics(tabItem));
+                }
+            };
+
             session.FrameReceived += (rect, seq) =>
             {
                 tabItem.FrameCount++;
@@ -1965,11 +2241,10 @@ internal sealed class MainForm : Form, IHostUi
                     }
                 }
 
-                BeginInvoke(() =>
+                if (!rect.IsEmpty)
                 {
-                    canvas.RecalculateLayout();
-                    canvas.Invalidate();
-                });
+                    BeginInvoke(() => canvas.InvalidateRemoteRect(rect));
+                }
             };
 
             session.MonitorsUpdated += (monitors, sel) =>
@@ -2175,6 +2450,21 @@ internal sealed class MainForm : Form, IHostUi
         return tcs.Task;
     }
 
+    public Task<AccessConfirmationResult> ConfirmAccessExtendedAsync(
+        string viewerName, string viewerId, string address, string code, string fingerprint, bool keyMismatch, CancellationToken ct)
+    {
+        var tcs = new TaskCompletionSource<AccessConfirmationResult>();
+        BeginInvoke(() =>
+        {
+            using var dlg = new AccessRequestDialog(viewerName, viewerId, address, code, fingerprint, keyMismatch);
+            var reg = ct.Register(() => dlg.BeginInvoke(dlg.Close));
+            dlg.ShowDialog(this);
+            reg.Dispose();
+            tcs.TrySetResult(new AccessConfirmationResult(dlg.IsAccepted, dlg.TrustDevice));
+        });
+        return tcs.Task;
+    }
+
     public void SessionStarted(HostSession session)
     {
         BeginInvoke(() =>
@@ -2268,13 +2558,19 @@ internal sealed class MainForm : Form, IHostUi
         _deviceRefreshTimer?.Dispose();
         _deviceRefreshTimer = null;
 
+        _statusPollCts.Cancel();
+        _statusPollCts.Dispose();
+
         _connectingTimer.Stop();
         _connectingTimer.Dispose();
         _connectingCts?.Cancel();
         _connectingCts?.Dispose();
 
+        ClearDeviceCardsAndDispose();
+
         _discovery.Dispose();
         _server.Dispose();
+        _signalingClient?.Dispose();
         base.OnFormClosing(e);
     }
 

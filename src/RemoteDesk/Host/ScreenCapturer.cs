@@ -2,6 +2,7 @@ using System.Drawing;
 using System.Runtime.InteropServices;
 using RemoteDesk.Common;
 using RemoteDesk.Native;
+using Vortice;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
@@ -11,7 +12,15 @@ namespace RemoteDesk.Host;
 internal sealed class CaptureLostException(string msg) : Exception(msg);
 
 /// <summary>擷取到的畫面（BGRA，32bpp），Data 在下一次 Capture 前有效。</summary>
-internal readonly record struct CapturedFrame(IntPtr Data, int Width, int Height, int Stride);
+internal readonly record struct CapturedFrame(
+    IntPtr Data,
+    int Width,
+    int Height,
+    int Stride,
+    bool HasMetadata = false,
+    IReadOnlyList<Rectangle>? DirtyRectangles = null,
+    IReadOnlyList<MoveRectangle>? MoveRectangles = null,
+    bool IsKeyFrame = false);
 
 internal interface IScreenCapturer : IDisposable
 {
@@ -94,13 +103,18 @@ internal sealed class DxgiCapturer : IScreenCapturer
     private readonly ID3D11Texture2D _staging;
     private readonly IntPtr _buffer;
     private readonly int _width, _height;
+    private OutduplMoveRect[] _moveRectBuffer = new OutduplMoveRect[16];
+    private RawRect[] _dirtyRectBuffer = new RawRect[64];
+    private readonly List<MoveRectangle> _moveRects = new();
+    private readonly List<Rectangle> _dirtyRects = new();
+    private CapturedFrame _frame;
     private bool _first = true;
     private bool _disposed;
 
     public string Name => "DXGI";
     public int Width => _width;
     public int Height => _height;
-    public CapturedFrame Frame => new(_buffer, _width, _height, _width * 4);
+    public CapturedFrame Frame => _frame;
 
     public DxgiCapturer(MonitorInfo monitor)
     {
@@ -173,7 +187,80 @@ internal sealed class DxgiCapturer : IScreenCapturer
         try
         {
             if (info.LastPresentTime == 0 && !_first) return false; // 只有游標移動
+            bool isKey = _first;
             _first = false;
+
+            _moveRects.Clear();
+            _dirtyRects.Clear();
+
+            if (isKey)
+            {
+                _dirtyRects.Add(new Rectangle(0, 0, _width, _height));
+            }
+            else if (info.TotalMetadataBufferSize > 0)
+            {
+                // 1. 讀取 Move Rectangles (位移資訊)
+                int neededMoveBytes = (int)info.TotalMetadataBufferSize;
+                int reqMoveCount = neededMoveBytes / 24 + 1;
+                if (_moveRectBuffer.Length < reqMoveCount)
+                    _moveRectBuffer = new OutduplMoveRect[reqMoveCount];
+
+                var moveRes = _dup.GetFrameMoveRects((uint)(_moveRectBuffer.Length * 24), _moveRectBuffer, out uint moveBytesOut);
+                if (moveRes.Success && moveBytesOut > 0)
+                {
+                    int count = (int)(moveBytesOut / 24);
+                    for (int i = 0; i < count; i++)
+                    {
+                        var m = _moveRectBuffer[i];
+                        int dw = m.DestinationRect.Right - m.DestinationRect.Left;
+                        int dh = m.DestinationRect.Bottom - m.DestinationRect.Top;
+                        if (dw > 0 && dh > 0)
+                        {
+                            var dstRect = new Rectangle(m.DestinationRect.Left, m.DestinationRect.Top, dw, dh);
+                            dstRect.Intersect(new Rectangle(0, 0, _width, _height));
+                            if (!dstRect.IsEmpty)
+                            {
+                                var srcPt = new Point(m.SourcePoint.X, m.SourcePoint.Y);
+                                _moveRects.Add(new MoveRectangle(srcPt, dstRect));
+                            }
+                        }
+                    }
+                }
+
+                // 2. 讀取 Dirty Rectangles (實質變更區域)
+                int neededDirtyBytes = (int)info.TotalMetadataBufferSize;
+                int reqDirtyCount = neededDirtyBytes / 16 + 1;
+                if (_dirtyRectBuffer.Length < reqDirtyCount)
+                    _dirtyRectBuffer = new RawRect[reqDirtyCount];
+
+                var dirtyRes = _dup.GetFrameDirtyRects((uint)(_dirtyRectBuffer.Length * 16), _dirtyRectBuffer, out uint dirtyBytesOut);
+                if (dirtyRes.Success && dirtyBytesOut > 0)
+                {
+                    int count = (int)(dirtyBytesOut / 16);
+                    for (int i = 0; i < count; i++)
+                    {
+                        var d = _dirtyRectBuffer[i];
+                        int dw = d.Right - d.Left;
+                        int dh = d.Bottom - d.Top;
+                        if (dw > 0 && dh > 0)
+                        {
+                            var r = new Rectangle(d.Left, d.Top, dw, dh);
+                            r.Intersect(new Rectangle(0, 0, _width, _height));
+                            if (!r.IsEmpty)
+                            {
+                                _dirtyRects.Add(r);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 若既無 Move 也無 Dirty 且非 KeyFrame，則無需更新
+            if (!isKey && _moveRects.Count == 0 && _dirtyRects.Count == 0)
+            {
+                return false;
+            }
+
             using var tex = resource!.QueryInterface<ID3D11Texture2D>();
             _context.CopyResource(_staging, tex);
             var map = _context.Map(_staging, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
@@ -189,6 +276,14 @@ internal sealed class DxgiCapturer : IScreenCapturer
                         Buffer.MemoryCopy(src + (long)y * map.RowPitch, dst + (long)y * rowBytes, rowBytes, rowBytes);
             }
             finally { _context.Unmap(_staging, 0); }
+
+            _frame = new CapturedFrame(
+                _buffer, _width, _height, _width * 4,
+                HasMetadata: true,
+                DirtyRectangles: _dirtyRects.ToArray(),
+                MoveRectangles: _moveRects.ToArray(),
+                IsKeyFrame: isKey);
+
             return true;
         }
         finally

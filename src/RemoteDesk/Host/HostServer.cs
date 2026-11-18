@@ -228,8 +228,12 @@ internal sealed class HostServer : IDisposable
         try
         {
             // 1. 安全握手 (ECDH + HKDF + AES-GCM)
-            byte[] salt = !string.IsNullOrEmpty(_config.PasswordSalt)
-                ? Convert.FromBase64String(_config.PasswordSalt)
+            bool unattendedEnabled = _config.UnattendedAccessEnabled;
+            string? saltB64 = _config.PasswordSalt;
+            string? verifierB64 = _config.PasswordVerifier;
+            bool hasPassword = unattendedEnabled && !string.IsNullOrEmpty(saltB64) && !string.IsNullOrEmpty(verifierB64);
+            byte[] salt = hasPassword
+                ? Convert.FromBase64String(saltB64!)
                 : RandomNumberGenerator.GetBytes(16);
 
             bool busy;
@@ -242,7 +246,7 @@ internal sealed class HostServer : IDisposable
                     _config.DeviceName,
                     salt,
                     _config.PasswordIterations,
-                    _config.HasPassword,
+                    hasPassword,
                     _config.AllowInteractive,
                     busy,
                     ch.Capabilities & ProtocolCapabilities.FrameSeqAck
@@ -354,8 +358,9 @@ internal sealed class HostServer : IDisposable
                         }
                         else
                         {
-                            // 需要驗證：若主機開啟互動授權，自動彈出連線確認視窗（若同時設定了密碼，則啟動雙軌並行）
-                            if (_config.AllowInteractive && _config.HasPassword)
+                            bool passwordAuthActive = _config.UnattendedAccessEnabled && _config.HasPassword;
+                            // 需要驗證：若主機開啟互動授權，自動彈出連線確認視窗（若同時啟用無人值守且設定了密碼，則啟動雙軌並行）
+                            if (_config.AllowInteractive && passwordAuthActive)
                             {
                                 // 雙軌並行模式：被控端自動彈出確認視窗，同時控制端亦可直接輸入密碼
                                 string code = channel.VerificationCode;
@@ -406,22 +411,33 @@ internal sealed class HostServer : IDisposable
                                         {
                                             var pr = new PacketReader(msg.AsSpan(1));
                                             var proof = pr.Bytes();
-                                            var storedVerifier = Convert.FromBase64String(_config.PasswordVerifier!);
-                                            var expectedProof = Crypto.PasswordProof(storedVerifier, channel.Transcript);
-
-                                            if (CryptographicOperations.FixedTimeEquals(proof, expectedProof))
+                                            var currentVerifierB64 = _config.PasswordVerifier;
+                                            if (!_config.UnattendedAccessEnabled || string.IsNullOrEmpty(currentVerifierB64))
                                             {
-                                                authenticated = true;
-                                                try { dualCts.Cancel(); } catch { } // 密碼驗證通過，自動關閉主機端彈出的確認視窗
-                                                Log.Info($"控制端 {viewerName} ({viewerId}) 透過連線密碼驗證成功！");
-                                                break;
+                                                Log.Info($"控制端 {viewerName} ({viewerId}) 送出密碼驗證，但主機未啟用無人值守或已清除密碼；維持等待本機手動核准");
+                                                var errPkt = new PacketWriter(0x03).Str("主機未啟用無人值守密碼驗證，請等待被控端按下接受連線").ToArray();
+                                                await channel.SendAsync(errPkt, cts.Token).ConfigureAwait(false);
+                                                receiveTask = channel.ReceiveAsync(dualCts.Token);
                                             }
                                             else
                                             {
-                                                Log.Warn($"控制端 {viewerName} ({viewerId}) 輸入之連線密碼錯誤");
-                                                var errPkt = new PacketWriter(0x03).Str("連線密碼錯誤，請重新輸入，或等待被控端接受連線").ToArray();
-                                                await channel.SendAsync(errPkt, cts.Token).ConfigureAwait(false);
-                                                receiveTask = channel.ReceiveAsync(dualCts.Token);
+                                                var storedVerifier = Convert.FromBase64String(currentVerifierB64);
+                                                var expectedProof = Crypto.PasswordProof(storedVerifier, channel.Transcript);
+
+                                                if (CryptographicOperations.FixedTimeEquals(proof, expectedProof))
+                                                {
+                                                    authenticated = true;
+                                                    try { dualCts.Cancel(); } catch { } // 密碼驗證通過，自動關閉主機端彈出的確認視窗
+                                                    Log.Info($"控制端 {viewerName} ({viewerId}) 透過連線密碼驗證成功！");
+                                                    break;
+                                                }
+                                                else
+                                                {
+                                                    Log.Warn($"控制端 {viewerName} ({viewerId}) 輸入之連線密碼錯誤");
+                                                    var errPkt = new PacketWriter(0x03).Str("連線密碼錯誤，請重新輸入，或等待被控端接受連線").ToArray();
+                                                    await channel.SendAsync(errPkt, cts.Token).ConfigureAwait(false);
+                                                    receiveTask = channel.ReceiveAsync(dualCts.Token);
+                                                }
                                             }
                                         }
                                         else
@@ -431,7 +447,7 @@ internal sealed class HostServer : IDisposable
                                     }
                                 }
                             }
-                            else if (_config.AllowInteractive && !_config.HasPassword)
+                            else if (_config.AllowInteractive && !passwordAuthActive)
                             {
                                 // 僅互動授權模式：自動彈出連線確認視窗
                                 string code = channel.VerificationCode;
@@ -453,7 +469,7 @@ internal sealed class HostServer : IDisposable
                                     rejectReason = "主機使用者拒絕了連線請求";
                                 }
                             }
-                            else if (!_config.AllowInteractive && _config.HasPassword)
+                            else if (!_config.AllowInteractive && passwordAuthActive)
                             {
                                 rejectReason = "NEED_PASSWORD:此主機已設定連線密碼，請輸入連線密碼。";
                             }
@@ -468,14 +484,38 @@ internal sealed class HostServer : IDisposable
         }
         else if (authMethod == AuthMethod.Password)
             {
-                if (!_config.HasPassword)
+                var currentVerifierB64 = _config.PasswordVerifier;
+                if (!_config.UnattendedAccessEnabled || string.IsNullOrEmpty(currentVerifierB64))
                 {
-                    rejectReason = "主機未啟用固定密碼，請使用互動授權連線";
+                    if (_config.AllowInteractive)
+                    {
+                        string code = channel.VerificationCode;
+                        Log.Info($"[連線請求] 主機未啟用無人值守固定密碼驗證，將密碼請求降級為互動核准：控制端={clientHello.ViewerName} ID={clientHello.ViewerId} 驗證碼={code}");
+                        bool confirmed = await _ui.ConfirmAccessAsync(
+                            clientHello.ViewerName,
+                            clientHello.ViewerId,
+                            remoteEndpoint,
+                            code,
+                            cts.Token).ConfigureAwait(false);
+
+                        if (confirmed)
+                        {
+                            authenticated = true;
+                        }
+                        else
+                        {
+                            rejectReason = "主機使用者拒絕了連線請求";
+                        }
+                    }
+                    else
+                    {
+                        rejectReason = "主機不允許互動授權連線且目前未設定驗證方式";
+                    }
                 }
                 else
                 {
                     var proof = r.Bytes();
-                    var storedVerifier = Convert.FromBase64String(_config.PasswordVerifier!);
+                    var storedVerifier = Convert.FromBase64String(currentVerifierB64);
                     var expectedProof = Crypto.PasswordProof(storedVerifier, channel.Transcript);
 
                     if (CryptographicOperations.FixedTimeEquals(proof, expectedProof))

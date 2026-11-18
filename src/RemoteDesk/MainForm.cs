@@ -2059,23 +2059,35 @@ internal sealed class MainForm : Form, IHostUi
                 session = new ViewerSession(clean, _viewerConfig, _discovery, _hostConfig.DeviceId, identity: null, signalingClient: _signalingClient);
 
                 ConnectPasswordDialog? activePwdDlg = null;
+                bool promptAcceptedBeforeShow = false;
+                object pwdDlgSync = new();
                 session.PasswordPromptHandler = ctx =>
                 {
                     var tcs = new TaskCompletionSource();
+                    ctx.CloseDialogOnRemoteAccepted = () =>
+                    {
+                        lock (pwdDlgSync) { promptAcceptedBeforeShow = true; }
+                        activePwdDlg?.RemoteAccepted();
+                    };
+
+                    ctx.ShowErrorMessage = err =>
+                    {
+                        activePwdDlg?.SetErrorMessage(err);
+                    };
+
                     BeginInvoke(() =>
                     {
+                        lock (pwdDlgSync)
+                        {
+                            if (promptAcceptedBeforeShow || IsDisposed)
+                            {
+                                tcs.TrySetResult();
+                                return;
+                            }
+                        }
+
                         string hostDisplayName = !string.IsNullOrEmpty(ctx.HostDisplayName) ? ctx.HostDisplayName : clean;
                         activePwdDlg = new ConnectPasswordDialog(hostDisplayName, ctx.HostDeviceId, prefilledPassword: null, allowInteractive: false, errorMessage: ctx.InitialError);
-
-                        ctx.CloseDialogOnRemoteAccepted = () =>
-                        {
-                            activePwdDlg?.RemoteAccepted();
-                        };
-
-                        ctx.ShowErrorMessage = err =>
-                        {
-                            activePwdDlg?.SetErrorMessage(err);
-                        };
 
                         activePwdDlg.PasswordSubmitted += async (enteredPwd, remember) =>
                         {
@@ -2114,8 +2126,12 @@ internal sealed class MainForm : Form, IHostUi
                 {
                     activePwdDlg?.Close();
                     StopConnectingAnimation();
+                    if (session.ClearedStaleSavedPassword)
+                    {
+                        _viewerConfig.Save();
+                    }
 
-                    if (ex is NeedPasswordException np || ex.Message.Contains("密碼"))
+                    if (ex is NeedPasswordException)
                     {
                         string hostDisplayName = !string.IsNullOrEmpty(session.HostDeviceName)
                             ? session.HostDeviceName

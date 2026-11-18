@@ -44,7 +44,8 @@ public class EndToEndLoopbackTests
             DeviceName = "LoopbackTestHost",
             TcpPort = testPort,
             HostEnabled = true,
-            AllowInteractive = true
+            AllowInteractive = true,
+            UnattendedAccessEnabled = true
         };
         hostConfig.SetPassword("RemoteDeskPassword999!");
 

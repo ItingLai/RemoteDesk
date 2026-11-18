@@ -531,7 +531,7 @@ public class UnattendedAndPairingLoopbackTests : IDisposable
             TcpPort = port,
             HostEnabled = true,
             AllowInteractive = true,
-            UnattendedAccessEnabled = false
+            UnattendedAccessEnabled = true
         };
         hostConfig.SetPassword("DualPassWord123!");
 
@@ -602,7 +602,7 @@ public class UnattendedAndPairingLoopbackTests : IDisposable
             TcpPort = port,
             HostEnabled = true,
             AllowInteractive = true,
-            UnattendedAccessEnabled = false
+            UnattendedAccessEnabled = true
         };
         hostConfig.SetPassword("DualPassWord456!");
 
@@ -632,5 +632,247 @@ public class UnattendedAndPairingLoopbackTests : IDisposable
         Assert.True(viewerSession.IsConnected);
         Assert.Equal(1, ui.PromptCount); // 被控端有自動彈出確認
         Assert.True(dialogClosed); // 密碼驗證通過後自動關閉對話盒
+    }
+
+    [Fact]
+    public async Task ClearedPassword_WithStaleViewerSavedPassword_SkipsPasswordAndPromptsHost()
+    {
+        int port = FindFreeTcpPort();
+        var hostDir = Path.Combine(_tempDir, "hostCleared1");
+        var viewerDir = Path.Combine(_tempDir, "viewerCleared1");
+
+        using var hostId = DeviceIdentity.LoadOrCreate(hostDir, "999777111", "HostCleared1");
+        using var viewerId = DeviceIdentity.LoadOrCreate(viewerDir, "111777999", "ViewerCleared1");
+
+        // 原先有設定密碼並開啟無人值守，之後清除密碼並關閉無人值守
+        var hostConfig = new HostConfig
+        {
+            DeviceId = hostId.DeviceId,
+            DeviceName = hostId.DeviceName,
+            TcpPort = port,
+            HostEnabled = true,
+            AllowInteractive = true,
+            UnattendedAccessEnabled = true
+        };
+        hostConfig.SetPassword("OldPass123!");
+        hostConfig.SetPassword(null);
+        hostConfig.UnattendedAccessEnabled = false;
+
+        var trustStore = new TrustStore(Path.Combine(hostDir, "trusted.json"));
+        var ui = new TrackingHostUi { AcceptResponse = true, TrustResponse = false };
+
+        using var hostDiscovery = new LanDiscovery(hostId.DeviceId, port: 21139);
+        using var hostServer = new HostServer(hostConfig, hostDiscovery, ui, trustStore, hostId);
+        hostServer.Start();
+
+        // 控制端仍保留舊密碼快取
+        var viewerConfig = new ViewerConfig { ViewerId = viewerId.DeviceId };
+        viewerConfig.RememberPassword(hostId.DeviceId, "OldPass123!");
+        viewerConfig.RememberPassword($"127.0.0.1:{port}", "OldPass123!");
+
+        bool passwordPrompted = false;
+        using var viewerDiscovery = new LanDiscovery(viewerId.DeviceId, port: 21140);
+        using var viewerSession = new ViewerSession($"127.0.0.1:{port}", viewerConfig, viewerDiscovery, null, viewerId);
+        viewerSession.PasswordPromptHandler = _ =>
+        {
+            passwordPrompted = true;
+            return Task.CompletedTask;
+        };
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await viewerSession.ConnectAsync("OldPass123!", cts.Token);
+
+        Assert.True(viewerSession.IsConnected);
+        Assert.Equal(1, ui.PromptCount); // 被控端必須跳出是否接受視窗
+        Assert.False(passwordPrompted); // 控制端不得跳出密碼視窗
+        Assert.True(viewerSession.ClearedStaleSavedPassword);
+        Assert.Null(viewerConfig.GetSavedPassword(hostId.DeviceId));
+        Assert.Null(viewerConfig.GetSavedPassword($"127.0.0.1:{port}"));
+    }
+
+    [Fact]
+    public async Task ClearedPassword_WithStaleViewerSavedPassword_HostRejects_DoesNotThrowNeedPassword()
+    {
+        int port = FindFreeTcpPort();
+        var hostDir = Path.Combine(_tempDir, "hostCleared2");
+        var viewerDir = Path.Combine(_tempDir, "viewerCleared2");
+
+        using var hostId = DeviceIdentity.LoadOrCreate(hostDir, "999777222", "HostCleared2");
+        using var viewerId = DeviceIdentity.LoadOrCreate(viewerDir, "222777999", "ViewerCleared2");
+
+        var hostConfig = new HostConfig
+        {
+            DeviceId = hostId.DeviceId,
+            DeviceName = hostId.DeviceName,
+            TcpPort = port,
+            HostEnabled = true,
+            AllowInteractive = true,
+            UnattendedAccessEnabled = false
+        };
+        hostConfig.SetPassword("OldPass456!");
+        hostConfig.SetPassword(null);
+
+        var trustStore = new TrustStore(Path.Combine(hostDir, "trusted.json"));
+        var ui = new TrackingHostUi { AcceptResponse = false }; // 被控端選擇拒絕
+
+        using var hostDiscovery = new LanDiscovery(hostId.DeviceId, port: 21141);
+        using var hostServer = new HostServer(hostConfig, hostDiscovery, ui, trustStore, hostId);
+        hostServer.Start();
+
+        var viewerConfig = new ViewerConfig { ViewerId = viewerId.DeviceId };
+        viewerConfig.RememberPassword($"127.0.0.1:{port}", "OldPass456!");
+
+        using var viewerDiscovery = new LanDiscovery(viewerId.DeviceId, port: 21142);
+        using var viewerSession = new ViewerSession($"127.0.0.1:{port}", viewerConfig, viewerDiscovery, null, viewerId);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var ex = await Assert.ThrowsAsync<UnauthorizedAccessException>(() => viewerSession.ConnectAsync("OldPass456!", cts.Token));
+        Assert.IsNotType<NeedPasswordException>(ex); // 不得誤判為 NeedPasswordException 造成無限輸入密碼迴圈
+        Assert.Equal(1, ui.PromptCount);
+        Assert.Contains("拒絕", ex.Message);
+        Assert.Null(viewerConfig.GetSavedPassword($"127.0.0.1:{port}"));
+    }
+
+    [Fact]
+    public async Task ClearedPassword_LegacyPasswordAuthPacket_FallsBackToInteractivePrompt()
+    {
+        int port = FindFreeTcpPort();
+        var hostDir = Path.Combine(_tempDir, "hostCleared3");
+        var viewerDir = Path.Combine(_tempDir, "viewerCleared3");
+
+        using var hostId = DeviceIdentity.LoadOrCreate(hostDir, "999777333", "HostCleared3");
+        using var viewerId = DeviceIdentity.LoadOrCreate(viewerDir, "333777999", "ViewerCleared3");
+
+        var hostConfig = new HostConfig
+        {
+            DeviceId = hostId.DeviceId,
+            DeviceName = hostId.DeviceName,
+            TcpPort = port,
+            HostEnabled = true,
+            AllowInteractive = true,
+            UnattendedAccessEnabled = false
+        };
+        hostConfig.SetPassword(null);
+
+        var ui = new TrackingHostUi { AcceptResponse = true };
+        using var hostDiscovery = new LanDiscovery(hostId.DeviceId, port: 21143);
+        using var hostServer = new HostServer(hostConfig, hostDiscovery, ui, new TrustStore(Path.Combine(hostDir, "trusted.json")), hostId);
+        hostServer.Start();
+
+        // 模擬未更新的舊版控制端無視 Hello.HasPassword=false 仍送出 AuthMethod.Password
+        using var tcp = new TcpClient(AddressFamily.InterNetwork);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await tcp.ConnectAsync(IPAddress.Loopback, port, cts.Token);
+        var (channel, hello) = await SecureChannel.ClientHandshakeAsync(tcp.GetStream(), viewerId.DeviceId, "LegacyViewer", cts.Token);
+        Assert.False(hello.HasPassword);
+
+        var staleKey = Crypto.DerivePasswordKey("LegacyCachedPass", hello.Salt, hello.Iterations);
+        var proof = Crypto.PasswordProof(staleKey, channel.Transcript);
+        await channel.SendAsync(new PacketWriter((byte)AuthMethod.Password).Bytes(proof).ToArray(), cts.Token);
+
+        var resp = await channel.ReceiveAsync(cts.Token);
+        Assert.NotEmpty(resp);
+        Assert.Equal(0x00, resp[0]); // 被控端自動降級為跳窗核准，按下接受後成功連線
+        Assert.Equal(1, ui.PromptCount);
+        channel.Dispose();
+    }
+
+    [Fact]
+    public async Task UnattendedOff_WithStoredPasswordAndTrustedDevice_StillPromptsHost()
+    {
+        int port = FindFreeTcpPort();
+        var hostDir = Path.Combine(_tempDir, "hostUnattendedOff1");
+        var viewerDir = Path.Combine(_tempDir, "viewerUnattendedOff1");
+
+        using var hostId = DeviceIdentity.LoadOrCreate(hostDir, "999777444", "HostUnattendedOff1");
+        using var viewerId = DeviceIdentity.LoadOrCreate(viewerDir, "444777999", "ViewerUnattendedOff1");
+
+        var trustStore = new TrustStore(Path.Combine(hostDir, "trusted.json"));
+        trustStore.AddOrUpdate(viewerId.DeviceId, viewerId.DeviceName, viewerId.PublicKeySpki, autoAccept: true);
+
+        // 先設定了密碼，之後僅將無人值守總開關關閉（尚未按清除密碼）
+        var hostConfig = new HostConfig
+        {
+            DeviceId = hostId.DeviceId,
+            DeviceName = hostId.DeviceName,
+            TcpPort = port,
+            HostEnabled = true,
+            AllowInteractive = true,
+            AutoAcceptTrustedDevices = true,
+            UnattendedAccessEnabled = false
+        };
+        hostConfig.SetPassword("StoredUnattendedPass999!");
+        Assert.True(hostConfig.HasPassword);
+
+        var ui = new TrackingHostUi { AcceptResponse = false }; // 被控端拒絕
+        using var hostDiscovery = new LanDiscovery(hostId.DeviceId, port: 21144);
+        using var hostServer = new HostServer(hostConfig, hostDiscovery, ui, trustStore, hostId);
+        hostServer.Start();
+
+        var viewerConfig = new ViewerConfig { ViewerId = viewerId.DeviceId };
+        viewerConfig.RememberPassword($"127.0.0.1:{port}", "StoredUnattendedPass999!");
+
+        bool passwordPrompted = false;
+        using var viewerDiscovery = new LanDiscovery(viewerId.DeviceId, port: 21145);
+        using var viewerSession = new ViewerSession($"127.0.0.1:{port}", viewerConfig, viewerDiscovery, null, viewerId);
+        viewerSession.PasswordPromptHandler = _ =>
+        {
+            passwordPrompted = true;
+            return Task.CompletedTask;
+        };
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        // 即使曾加入可信清單且控制端送入原本正確的密碼，關閉無人值守後不得直接放行
+        var ex = await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>
+            viewerSession.ConnectAsync("StoredUnattendedPass999!", cts.Token));
+        Assert.IsNotType<NeedPasswordException>(ex);
+        Assert.Equal(1, ui.PromptCount);
+        Assert.False(passwordPrompted);
+        Assert.False(viewerSession.IsConnected);
+    }
+
+    [Fact]
+    public async Task UnattendedOff_WithStoredPassword_LegacyPasswordPacket_StillPromptsHost()
+    {
+        int port = FindFreeTcpPort();
+        var hostDir = Path.Combine(_tempDir, "hostUnattendedOff2");
+        var viewerDir = Path.Combine(_tempDir, "viewerUnattendedOff2");
+
+        using var hostId = DeviceIdentity.LoadOrCreate(hostDir, "999777555", "HostUnattendedOff2");
+        using var viewerId = DeviceIdentity.LoadOrCreate(viewerDir, "555777999", "ViewerUnattendedOff2");
+
+        var hostConfig = new HostConfig
+        {
+            DeviceId = hostId.DeviceId,
+            DeviceName = hostId.DeviceName,
+            TcpPort = port,
+            HostEnabled = true,
+            AllowInteractive = true,
+            UnattendedAccessEnabled = false
+        };
+        hostConfig.SetPassword("StoredUnattendedPass888!");
+
+        var ui = new TrackingHostUi { AcceptResponse = false }; // 被控端拒絕
+        using var hostDiscovery = new LanDiscovery(hostId.DeviceId, port: 21146);
+        using var hostServer = new HostServer(hostConfig, hostDiscovery, ui, new TrustStore(Path.Combine(hostDir, "trusted.json")), hostId);
+        hostServer.Start();
+
+        using var tcp = new TcpClient(AddressFamily.InterNetwork);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await tcp.ConnectAsync(IPAddress.Loopback, port, cts.Token);
+        var (channel, hello) = await SecureChannel.ClientHandshakeAsync(tcp.GetStream(), viewerId.DeviceId, "LegacyViewer", cts.Token);
+        Assert.False(hello.HasPassword); // 無人值守關閉時不得宣告密碼登入可用
+
+        // 即使舊版控制端以本機密碼鹽嘗試 AuthMethod.Password，也必須交由主機彈窗核准
+        var salt = Convert.FromBase64String(hostConfig.PasswordSalt!);
+        var key = Crypto.DerivePasswordKey("StoredUnattendedPass888!", salt, hostConfig.PasswordIterations);
+        var proof = Crypto.PasswordProof(key, channel.Transcript);
+        await channel.SendAsync(new PacketWriter((byte)AuthMethod.Password).Bytes(proof).ToArray(), cts.Token);
+
+        var resp = await channel.ReceiveAsync(cts.Token);
+        Assert.NotEmpty(resp);
+        Assert.Equal(0xFE, resp[0]); // 因被控端選擇拒絕而遭到拒絕，絕不可憑密碼直接放行
+        Assert.Equal(1, ui.PromptCount);
+        channel.Dispose();
     }
 }

@@ -216,7 +216,7 @@ internal sealed class SignalingClient : IDisposable
     {
         long timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         string nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
-        string version = typeof(SignalingClient).Assembly.GetName().Version?.ToString(3) ?? "2.0.0";
+        string version = typeof(SignalingClient).Assembly.GetName().Version?.ToString(3) ?? "2.0.1";
         var localIps = LanDiscovery.LocalIPv4().Select(x => x.ip.ToString()).ToList();
 
         // 訊息格式: REGISTER:{deviceId}:{deviceName}:{publicKey}:{version}:{timestamp}:{nonce}

@@ -119,6 +119,7 @@ internal sealed class ViewerSession : IDisposable
     private readonly SignalingClient? _signalingClient;
 
     public string? HostPublicKeyFingerprint { get; private set; }
+    internal bool ClearedStaleSavedPassword { get; private set; }
     public Func<PasswordPromptContext, Task>? PasswordPromptHandler { get; set; }
 
     // 影格時序診斷 (Frame Timing Telemetry)
@@ -385,10 +386,17 @@ internal sealed class ViewerSession : IDisposable
         }
 
         // 2. 身份驗證
+        if (!string.IsNullOrEmpty(password) && !hello.HasPassword)
+        {
+            Log.Info($"[Auth] 目標主機 {hello.HostName} ({hello.HostId}) 未啟用密碼保護，略過舊快取密碼並改採一般授權驗證流程。");
+            ClearStaleSavedPassword(cleanTarget, hello.HostId);
+            password = null;
+        }
+
         byte[] sentNonce = Array.Empty<byte>();
         long sentTimestamp = 0;
 
-        if (!string.IsNullOrEmpty(password))
+        if (!string.IsNullOrEmpty(password) && hello.HasPassword)
         {
             var key = Crypto.DerivePasswordKey(password, hello.Salt, hello.Iterations);
             var proof = Crypto.PasswordProof(key, channel.Transcript);
@@ -481,7 +489,8 @@ internal sealed class ViewerSession : IDisposable
         {
             var r = new PacketReader(resp.AsSpan(1));
             string reason = r.Remaining > 0 ? r.Str() : "驗證被主機拒絕";
-            if (resp[0] == 0x02 || reason.StartsWith("NEED_PASSWORD:") || reason.Contains("連線密碼") || reason.Contains("密碼") || reason.Contains("PASSWORD"))
+            if (resp[0] == 0x02 ||
+                (hello.HasPassword && (reason.StartsWith("NEED_PASSWORD:") || reason.Contains("連線密碼") || reason.Contains("密碼") || reason.Contains("PASSWORD"))))
             {
                 string cleanReason = reason.StartsWith("NEED_PASSWORD:") ? reason["NEED_PASSWORD:".Length..] : reason;
                 throw new NeedPasswordException(hello.AllowInteractive, cleanReason);
@@ -1020,6 +1029,20 @@ internal sealed class ViewerSession : IDisposable
             }
             catch { }
         }
+    }
+
+    private void ClearStaleSavedPassword(string cleanTarget, string hostId)
+    {
+        bool changed = false;
+        if (!string.IsNullOrEmpty(cleanTarget) && _config.SavedPasswords.Remove(cleanTarget))
+            changed = true;
+        if (!string.IsNullOrEmpty(TargetIdOrHost) && _config.SavedPasswords.Remove(TargetIdOrHost))
+            changed = true;
+        if (!string.IsNullOrEmpty(hostId) && _config.SavedPasswords.Remove(hostId))
+            changed = true;
+
+        if (changed)
+            ClearedStaleSavedPassword = true;
     }
 
     private void LogTelemetryIfDue(HostStreamTelemetry telemetry)

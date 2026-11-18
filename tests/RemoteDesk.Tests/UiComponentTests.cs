@@ -952,7 +952,8 @@ public class UiComponentTests
             DeviceName = "HostTest",
             TcpPort = port,
             HostEnabled = true,
-            AllowInteractive = false
+            AllowInteractive = false,
+            UnattendedAccessEnabled = true
         };
         var salt = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
         hostCfg.PasswordSalt = Convert.ToBase64String(salt);
@@ -1001,7 +1002,8 @@ public class UiComponentTests
             DeviceName = "HostDisconnectTest",
             TcpPort = port,
             HostEnabled = true,
-            AllowInteractive = false
+            AllowInteractive = false,
+            UnattendedAccessEnabled = true
         };
         var salt = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
         hostCfg.PasswordSalt = Convert.ToBase64String(salt);
@@ -1071,7 +1073,8 @@ public class UiComponentTests
             DeviceName = "HostStayAliveTest",
             TcpPort = port,
             HostEnabled = true,
-            AllowInteractive = false
+            AllowInteractive = false,
+            UnattendedAccessEnabled = true
         };
         var salt = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
         hostCfg.PasswordSalt = Convert.ToBase64String(salt);
@@ -1560,7 +1563,7 @@ public class UiComponentTests
         string repoRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../.."));
         string ver = RemoteDesk.Installer.InstallerEngine.AppVersion;
 
-        Assert.Equal("2.0.0", ver);
+        Assert.Equal("2.0.1", ver);
         Assert.Matches(@"^\d+\.\d+\.\d+$", ver);
         Assert.Equal(ver, typeof(MainForm).Assembly.GetName().Version?.ToString(3));
         Assert.Equal(ver, typeof(RemoteDesk.Installer.InstallerEngine).Assembly.GetName().Version?.ToString(3));

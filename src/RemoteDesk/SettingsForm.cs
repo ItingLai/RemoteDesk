@@ -297,14 +297,31 @@ internal sealed class SettingsForm : Form
         };
         var lblPwdStatus = new Label
         {
-            Text = _hostConfig.HasPassword
-                ? "狀態：● 已設定固定連線密碼保護 (若不需變更請留空)"
-                : "狀態：○ 未設定密碼 (僅允許手動核准或已配對可信裝置)",
-            ForeColor = _hostConfig.HasPassword ? Theme.Success : Theme.TextSecondary,
             Font = Theme.SmallFont,
             Location = new Point(0, 228),
             AutoSize = true
         };
+
+        void UpdatePwdStatusLabel()
+        {
+            if (!_hostConfig.HasPassword)
+            {
+                lblPwdStatus.Text = "狀態：○ 未設定密碼 (僅允許手動核准或已配對可信裝置)";
+                lblPwdStatus.ForeColor = Theme.TextSecondary;
+            }
+            else if (_chkUnattendedAccess.Checked)
+            {
+                lblPwdStatus.Text = "狀態：● 已啟用無人值守固定連線密碼保護 (若不需變更請留空)";
+                lblPwdStatus.ForeColor = Theme.Success;
+            }
+            else
+            {
+                lblPwdStatus.Text = "狀態：○ 已儲存密碼，但目前未勾選啟用無人值守模式（固定密碼已暫停使用）";
+                lblPwdStatus.ForeColor = Theme.Warning;
+            }
+        }
+        UpdatePwdStatusLabel();
+        _chkUnattendedAccess.CheckedChanged += (_, _) => UpdatePwdStatusLabel();
 
         var lblPwd = new Label
         {
@@ -347,8 +364,7 @@ internal sealed class SettingsForm : Form
                 _hostConfig.TrySave();
                 _txtPassword.Clear();
                 _txtConfirm.Clear();
-                lblPwdStatus.Text = "狀態：○ 未設定密碼 (僅允許手動核准或已配對可信裝置)";
-                lblPwdStatus.ForeColor = Theme.TextSecondary;
+                UpdatePwdStatusLabel();
                 btnClearPassword.Enabled = false;
                 MessageBox.Show(this, "連線密碼已成功清除！", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }

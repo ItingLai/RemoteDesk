@@ -70,6 +70,10 @@ internal static class Program
                     string? pwd = viewerCfg.GetSavedPassword(target);
                     using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
                     session.ConnectAsync(pwd, cts.Token).GetAwaiter().GetResult();
+                    if (session.ClearedStaleSavedPassword)
+                    {
+                        viewerCfg.Save();
+                    }
                     Application.Run(new ViewerForm(session));
                     return;
                 }

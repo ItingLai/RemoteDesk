@@ -72,6 +72,9 @@ internal sealed class CategoryNavButton : Control
             case "Account":
                 VectorIcons.DrawUser(g, iconBounds, iconClr);
                 break;
+            case "About":
+                VectorIcons.DrawMonitorWithLabel(g, iconBounds, "i", iconClr);
+                break;
         }
 
         // 4. 文字標題
@@ -642,6 +645,51 @@ internal sealed class SettingsForm : Form
         };
         pnlAccount.Controls.AddRange(new Control[] { _lblDeviceId, _lblDeviceName, _lblFingerprint, btnRegenerate, lblAccountMode });
 
+        // 7. About Panel (關於本機)
+        string appVer = typeof(SettingsForm).Assembly.GetName().Version?.ToString(3) ?? "2.0.2";
+        var pnlAbout = CreateContentPanel("About This Device (關於本機)");
+        var lblAppVersion = new Label
+        {
+            Text = $"程式版本：RemoteDesk v{appVer}",
+            Font = Theme.CreateFont(11f, FontStyle.Bold),
+            ForeColor = Theme.Accent,
+            Location = new Point(0, 48),
+            AutoSize = true
+        };
+        var lblAboutDeviceId = new Label
+        {
+            Text = $"本機裝置 ID：{AppConfig.FormatId(_identity.DeviceId)}",
+            Font = Theme.BodyFont,
+            ForeColor = Theme.TextPrimary,
+            Location = new Point(0, 82),
+            AutoSize = true
+        };
+        var lblAboutHostName = new Label
+        {
+            Text = $"電腦名稱：{_identity.DeviceName} ({Environment.MachineName})",
+            Font = Theme.BodyFont,
+            ForeColor = Theme.TextPrimary,
+            Location = new Point(0, 112),
+            AutoSize = true
+        };
+        var lblAboutRuntime = new Label
+        {
+            Text = $"執行環境：.NET {Environment.Version}\n作業系統：{System.Runtime.InteropServices.RuntimeInformation.OSDescription}",
+            Font = Theme.SmallFont,
+            ForeColor = Theme.TextSecondary,
+            Location = new Point(0, 148),
+            Size = new Size(580, 44)
+        };
+        var lblAboutProtocol = new Label
+        {
+            Text = "傳輸與加密架構：LAN TCP + WAN 純 P2P IPv4 UDP / ECDH P-256 + AES-256-GCM",
+            Font = Theme.SmallFont,
+            ForeColor = Theme.TextSecondary,
+            Location = new Point(0, 198),
+            Size = new Size(580, 24)
+        };
+        pnlAbout.Controls.AddRange(new Control[] { lblAppVersion, lblAboutDeviceId, lblAboutHostName, lblAboutRuntime, lblAboutProtocol });
+
         // 註冊分類面板
         _categoryPanels["General"] = pnlGeneral;
         _categoryPanels["Security"] = pnlSecurity;
@@ -649,6 +697,7 @@ internal sealed class SettingsForm : Form
         _categoryPanels["Audio"] = pnlAudio;
         _categoryPanels["Network"] = pnlNetwork;
         _categoryPanels["Account"] = pnlAccount;
+        _categoryPanels["About"] = pnlAbout;
 
         // 建立左側導覽按鈕
         AddNavButton("General", "一般設定");
@@ -657,6 +706,7 @@ internal sealed class SettingsForm : Form
         AddNavButton("Audio", "音訊設定");
         AddNavButton("Network", "網路與連接埠");
         AddNavButton("Account", "裝置身分金鑰");
+        AddNavButton("About", "關於本機");
 
         Controls.Add(_pnlContent);
         Controls.Add(_pnlSidebar);

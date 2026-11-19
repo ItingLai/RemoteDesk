@@ -160,7 +160,7 @@ internal sealed class HostServer : IDisposable
                             try
                             {
                                 var retryOpts = UdpHolePuncher.BuildRetryOptionsFromTimeout(
-                                    timeoutMs: 15000,
+                                    timeoutMs: 22000,
                                     gatheringOptions: new IceGatheringOptions
                                     {
                                         StunTimeoutMs = 1500,

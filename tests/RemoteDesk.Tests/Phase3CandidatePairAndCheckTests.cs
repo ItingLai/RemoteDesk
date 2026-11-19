@@ -1047,6 +1047,136 @@ public sealed class Phase3CandidatePairAndCheckTests : IDisposable
         return (g, c1, c2);
     }
 
+    // ------------------------------------------------------------
+    // 測試 14：Multi-WAN / CGNAT 來源 IP 與對端通告候選完全不同時，Controlled 與 Controlling 皆應動態建立 prflx Pair 並收斂
+    // ------------------------------------------------------------
+    [Fact]
+    public async Task Scenario14_PeerReflexive_WhenNatChangesSourceIpNotInAdvertisedCandidates_BothRolesConverge()
+    {
+        // Case A: Controlled 端未收到 Controlling 實際出口 IP (127.0.0.77)，僅持有其他失效候選 (127.0.0.201/202)
+        {
+            var peerA = CreateBoundPeer("A14a", "127.0.0.2");
+            var peerB = CreateBoundPeer("B14a", "127.0.0.3");
+            var bridge = new NatUdpBridge(
+                (IPEndPoint)peerA.socket.LocalEndPoint!,
+                (IPEndPoint)peerB.socket.LocalEndPoint!,
+                bindIpA: "127.0.0.88",
+                bindIpB: "127.0.0.77");
+            _disposables.Add(bridge);
+
+            var remA = new[]
+            {
+                CloneWithEp(peerB.localCand, bridge.EndPointForA)
+            };
+            var remB = new[]
+            {
+                new IceCandidate { CandidateId = peerA.localCand.CandidateId, Type = IceCandidateType.Host, Ip = "127.0.0.201", Port = 45001, Priority = 900, DiscoveryTimestamp = DateTime.UtcNow, ValidityStatus = CandidateValidityStatus.Valid },
+                new IceCandidate { CandidateId = peerA.localCand.CandidateId + "-s1", Type = IceCandidateType.Srflx, Ip = "127.0.0.202", Port = 45002, Priority = 1100, DiscoveryTimestamp = DateTime.UtcNow, ValidityStatus = CandidateValidityStatus.Valid }
+            };
+
+            var opts = new IceConnectivityOptions { CheckTimeoutMs = 2500, NominationTimeoutMs = 500, SelectionGraceWindowMs = 25 };
+            var tA = IceConnectivityChecker.RunAsync(peerA.gathering, remA, "att-14a", "sess-14a", "111000141", "222000142", isInitiator: true, opts);
+            var tB = IceConnectivityChecker.RunAsync(peerB.gathering, remB, "att-14a", "sess-14a", "222000142", "111000141", isInitiator: false, opts);
+            await Task.WhenAll(tA, tB);
+
+            var resA = await tA;
+            var resB = await tB;
+
+            Assert.True(resA.Succeeded, resA.FinalFailureReason);
+            Assert.True(resB.Succeeded, resB.FinalFailureReason);
+            Assert.Equal(bridge.EndPointForA, resA.SelectedPair!.RemoteEndPoint);
+            Assert.Equal(bridge.EndPointForB, resB.SelectedPair!.RemoteEndPoint);
+            Assert.Contains("#prflx-127.0.0.77-", resB.SelectedPair.RemoteCandidateId, StringComparison.Ordinal);
+        }
+
+        // Case B: Controlling 端未收到 Controlled 實際出口 IP (127.0.0.88)，由 Controlled 主動檢查觸發 Controlling 建立 prflx
+        {
+            var peerA = CreateBoundPeer("A14b", "127.0.0.2");
+            var peerB = CreateBoundPeer("B14b", "127.0.0.3");
+            var bridge = new NatUdpBridge(
+                (IPEndPoint)peerA.socket.LocalEndPoint!,
+                (IPEndPoint)peerB.socket.LocalEndPoint!,
+                bindIpA: "127.0.0.88",
+                bindIpB: "127.0.0.77");
+            _disposables.Add(bridge);
+
+            var remA = new[]
+            {
+                new IceCandidate { CandidateId = peerB.localCand.CandidateId, Type = IceCandidateType.Srflx, Ip = "127.0.0.201", Port = 45003, Priority = 1000, DiscoveryTimestamp = DateTime.UtcNow, ValidityStatus = CandidateValidityStatus.Valid }
+            };
+            var remB = new[]
+            {
+                CloneWithEp(peerA.localCand, bridge.EndPointForB)
+            };
+
+            var opts = new IceConnectivityOptions { CheckTimeoutMs = 2500, NominationTimeoutMs = 500, SelectionGraceWindowMs = 25 };
+            var tA = IceConnectivityChecker.RunAsync(peerA.gathering, remA, "att-14b", "sess-14b", "111000143", "222000144", isInitiator: true, opts);
+            var tB = IceConnectivityChecker.RunAsync(peerB.gathering, remB, "att-14b", "sess-14b", "222000144", "111000143", isInitiator: false, opts);
+            await Task.WhenAll(tA, tB);
+
+            var resA = await tA;
+            var resB = await tB;
+
+            Assert.True(resA.Succeeded, resA.FinalFailureReason);
+            Assert.True(resB.Succeeded, resB.FinalFailureReason);
+            Assert.Equal(bridge.EndPointForA, resA.SelectedPair!.RemoteEndPoint);
+            Assert.Equal(bridge.EndPointForB, resB.SelectedPair!.RemoteEndPoint);
+            Assert.Contains("#prflx-127.0.0.88-", resA.SelectedPair.RemoteCandidateId, StringComparison.Ordinal);
+        }
+    }
+
+    // ------------------------------------------------------------
+    // 測試 15：無備援通道時，NominateAck 延遲超過 NominationTimeoutMs 但於 CheckTimeoutMs 內到達仍可收斂成功
+    // ------------------------------------------------------------
+    [Fact]
+    public async Task Scenario15_SingleSurvivingPair_DelayedNominateAckWithinCheckTimeout_StillConverges()
+    {
+        var peerA = CreateBoundPeer("A15", "127.0.0.2");
+        var peerB = CreateBoundPeer("B15", "127.0.0.3");
+        var bridge = new NatUdpBridge(
+            (IPEndPoint)peerA.socket.LocalEndPoint!,
+            (IPEndPoint)peerB.socket.LocalEndPoint!,
+            bindIpA: "127.0.0.10",
+            bindIpB: "127.0.0.11");
+        _disposables.Add(bridge);
+
+        bridge.CustomDelayBtoAForPacket = (pkt, _) =>
+            IceCheckCodec.TryParse(pkt, out var msg) && msg.MessageType == IceCheckMessageType.NominateAck ? 240 : 0;
+
+        var deadUnreachable = new IceCandidate
+        {
+            CandidateId = peerB.localCand.CandidateId + "-dead",
+            Type = IceCandidateType.Srflx,
+            Ip = "127.0.0.201",
+            Port = 54321,
+            Priority = peerB.localCand.Priority - 10,
+            DiscoveryTimestamp = DateTime.UtcNow,
+            ValidityStatus = CandidateValidityStatus.Valid
+        };
+        var remA = new[] { CloneWithEp(peerB.localCand, bridge.EndPointForA), deadUnreachable };
+        var remB = new[] { CloneWithEp(peerA.localCand, bridge.EndPointForB) };
+
+        var opts = new IceConnectivityOptions
+        {
+            CheckTimeoutMs = 1800,
+            NominationTimeoutMs = 110,
+            SelectionGraceWindowMs = 15,
+            RetryIntervalsMs = new[] { 200, 300, 400 } // 確保無效 Pair 在 110ms 時仍為 InProgress，驗證不會因此誤殺唯一成功通道
+        };
+
+        var tA = IceConnectivityChecker.RunAsync(peerA.gathering, remA, "att-15", "sess-15", "111000151", "222000152", isInitiator: true, opts);
+        var tB = IceConnectivityChecker.RunAsync(peerB.gathering, remB, "att-15", "sess-15", "222000152", "111000151", isInitiator: false, opts);
+        await Task.WhenAll(tA, tB);
+
+        var resA = await tA;
+        var resB = await tB;
+
+        Assert.True(resA.Succeeded, resA.FinalFailureReason);
+        Assert.True(resB.Succeeded, resB.FinalFailureReason);
+        Assert.Equal(bridge.EndPointForA, resA.SelectedPair!.RemoteEndPoint);
+        Assert.Equal(bridge.EndPointForB, resB.SelectedPair!.RemoteEndPoint);
+    }
+
     private static IceCandidate CloneWithEp(IceCandidate src, IPEndPoint ep) => new()
     {
         CandidateId = src.CandidateId,

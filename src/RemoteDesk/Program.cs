@@ -103,7 +103,8 @@ internal static class Program
             return;
         }
 
-        Log.Info($"[Startup] 已取得單一主程式實例鎖 (Profile={profile ?? "default"}, DeviceId={initialHostCfg.DeviceId}, Mutex={singleInstance.MutexName})。");
+        string appVersion = typeof(Program).Assembly.GetName().Version?.ToString(3) ?? "2.0.2";
+        Log.Info($"[Startup] 已取得單一主程式實例鎖 (Version={appVersion}, Profile={profile ?? "default"}, DeviceId={initialHostCfg.DeviceId}, Mutex={singleInstance.MutexName})。");
 
         if (customPort.HasValue)
         {

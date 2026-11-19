@@ -677,16 +677,27 @@ internal sealed class IceConnectivityChecker
         CandidatePair? matchedPair;
         bool shouldTrigger = false;
 
+        bool remoteExchangeDone = _options.IsRemoteExchangeCompleteProvider?.Invoke() ?? true;
+
         lock (_stateLock)
         {
             if (_selectedPair != null && _currentRole != IceRole.Controlled) return;
+
+            bool allowPrflx = _currentRole == IceRole.Controlled;
+            if (!allowPrflx && !_options.AllowRestrictedPortPredictionFallback && remoteExchangeDone)
+            {
+                allowPrflx = !_pairsBySocket.TryGetValue(binding.SocketId, out var existingList) ||
+                    !existingList.Any(p =>
+                        p.CheckState != CandidatePairCheckState.Invalidated &&
+                        p.RemoteEndPoint.Address.Equals(fromEp.Address));
+            }
 
             matchedPair = FindOrRegisterInboundPairLocked(
                 binding,
                 fromEp,
                 msg.RemoteCandidateId,
                 msg.LocalCandidateId,
-                allowPeerReflexive: _currentRole == IceRole.Controlled,
+                allowPeerReflexive: allowPrflx,
                 out bool newlyRegisteredPrflx);
             if (newlyRegisteredPrflx)
             {
@@ -1058,6 +1069,28 @@ internal sealed class IceConnectivityChecker
         if (wake) WakeScheduler();
     }
 
+    private async Task<IReadOnlyList<IceCandidate>> PollIncrementalRemotesAsync(
+        Func<CancellationToken, Task<IReadOnlyList<IceCandidate>>> provider,
+        CancellationToken ct)
+    {
+        try
+        {
+            return await provider(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return Array.Empty<IceCandidate>();
+        }
+        catch
+        {
+            return Array.Empty<IceCandidate>();
+        }
+        finally
+        {
+            WakeScheduler();
+        }
+    }
+
     private async Task RunChecksAndSelectionLoopAsync(
         IReadOnlyList<CandidatePair> scheduleOrder,
         bool isFallbackPass,
@@ -1085,6 +1118,7 @@ internal sealed class IceConnectivityChecker
         long lastNominationSendMs = -1000;
         long nominationStartMs = -1;
         long lastIncrementalPollMs = 0;
+        Task<IReadOnlyList<IceCandidate>>? inFlightIncrementalPollTask = null;
 
         while (!ct.IsCancellationRequested && !ShouldExitSelectionLoop(out _))
         {
@@ -1106,50 +1140,65 @@ internal sealed class IceConnectivityChecker
                 }
             }
 
-            // 0. 增量遠端候選端點輪詢 (Phase 4 PAC 與對端非同步重試同步)：動態加入新收到的遠端 Candidate
+            // 0. 增量遠端候選端點輪詢 (非阻塞)：於背景拉取 Signaling 新候選，避免阻塞本輪 UDP Check / Nominate 排程
+            if (inFlightIncrementalPollTask != null && inFlightIncrementalPollTask.IsCompleted)
+            {
+                IReadOnlyList<IceCandidate> polledRemotes;
+                try
+                {
+                    polledRemotes = await inFlightIncrementalPollTask.ConfigureAwait(false);
+                }
+                catch
+                {
+                    polledRemotes = Array.Empty<IceCandidate>();
+                }
+                finally
+                {
+                    inFlightIncrementalPollTask = null;
+                    lastIncrementalPollMs = sw.ElapsedMilliseconds;
+                }
+
+                var brandNew = new List<IceCandidate>();
+                foreach (var rc in polledRemotes)
+                {
+                    string rk = $"{rc.CandidateId}|{rc.Ip}:{rc.Port}";
+                    if (knownRemoteIds.Add(rk))
+                    {
+                        brandNew.Add(rc);
+                    }
+                }
+
+                if (brandNew.Count > 0)
+                {
+                    var extraPlan = CandidatePairBuilder.BuildPairs(
+                        _gathering,
+                        brandNew,
+                        _remoteDeviceId,
+                        _currentRole,
+                        _options,
+                        includePortPredictionFallback: false);
+                    var addedPairs = RegisterPairs(extraPlan.CheckSchedulePairs);
+                    if (addedPairs.Count > 0)
+                    {
+                        long baseNowMs = sw.ElapsedMilliseconds;
+                        for (int idx = 0; idx < addedPairs.Count; idx++)
+                        {
+                            var np = addedPairs[idx];
+                            activeSchedule.Add(np);
+                            nextSendDueMs[np] = baseNowMs + (long)idx * Math.Max(0, _options.PacingIntervalMs);
+                        }
+                        Log.Info($"[ICE/Pair] Attempt={_connectionAttemptId}, Session={_sessionId} 動態加入 {addedPairs.Count} 組新遠端 Candidate Pair 進入檢查");
+                    }
+                }
+            }
+
             if (!isFallbackPass &&
+                inFlightIncrementalPollTask == null &&
                 _options.IncrementalRemoteCandidatePollProvider != null &&
                 (nowMs - lastIncrementalPollMs) >= Math.Max(40, _options.IncrementalPollIntervalMs))
             {
                 lastIncrementalPollMs = nowMs;
-                try
-                {
-                    var polledRemotes = await _options.IncrementalRemoteCandidatePollProvider(ct).ConfigureAwait(false);
-                    var brandNew = new List<IceCandidate>();
-                    foreach (var rc in polledRemotes)
-                    {
-                        string rk = $"{rc.CandidateId}|{rc.Ip}:{rc.Port}";
-                        if (knownRemoteIds.Add(rk))
-                        {
-                            brandNew.Add(rc);
-                        }
-                    }
-
-                    if (brandNew.Count > 0)
-                    {
-                        var extraPlan = CandidatePairBuilder.BuildPairs(
-                            _gathering,
-                            brandNew,
-                            _remoteDeviceId,
-                            _currentRole,
-                            _options,
-                            includePortPredictionFallback: false);
-                        var addedPairs = RegisterPairs(extraPlan.CheckSchedulePairs);
-                        if (addedPairs.Count > 0)
-                        {
-                            long baseNowMs = sw.ElapsedMilliseconds;
-                            for (int idx = 0; idx < addedPairs.Count; idx++)
-                            {
-                                var np = addedPairs[idx];
-                                activeSchedule.Add(np);
-                                nextSendDueMs[np] = baseNowMs + (long)idx * Math.Max(0, _options.PacingIntervalMs);
-                            }
-                            Log.Info($"[ICE/Pair] Attempt={_connectionAttemptId}, Session={_sessionId} 動態加入 {addedPairs.Count} 組新遠端 Candidate Pair 進入檢查");
-                        }
-                    }
-                }
-                catch (OperationCanceledException) { }
-                catch { }
+                inFlightIncrementalPollTask = PollIncrementalRemotesAsync(_options.IncrementalRemoteCandidatePollProvider, ct);
             }
 
             // 1. 優先處理 Triggered Check 佇列（收到對端 CheckRequest/Nominate 時即時回覆檢查）
@@ -1186,10 +1235,21 @@ internal sealed class IceConnectivityChecker
                         }
                         else if (nominationStartMs >= 0 && (nowMs - nominationStartMs) >= _options.NominationTimeoutMs)
                         {
-                            _activeNominationPair.CheckState = CandidatePairCheckState.TimedOut;
-                            _activeNominationPair.FailureReason = CandidatePairFailureReason.Timeout;
-                            _activeNominationPair.FailureDetail = "Nomination ACK timeout";
-                            _activeNominationPair = null;
+                            bool hasSucceededAlternative = _allPairs.Any(p =>
+                                !ReferenceEquals(p, _activeNominationPair) &&
+                                p.CheckState == CandidatePairCheckState.Succeeded);
+
+                            if (hasSucceededAlternative)
+                            {
+                                _activeNominationPair.CheckState = CandidatePairCheckState.TimedOut;
+                                _activeNominationPair.FailureReason = CandidatePairFailureReason.Timeout;
+                                _activeNominationPair.FailureDetail = "Nomination ACK timeout";
+                                _activeNominationPair = null;
+                            }
+                            else
+                            {
+                                nomTarget = _activeNominationPair;
+                            }
                         }
                         else
                         {
@@ -1550,28 +1610,38 @@ internal sealed class IceConnectivityChecker
         out bool newlyRegisteredPrflx)
     {
         newlyRegisteredPrflx = false;
-        if (!_pairsBySocket.TryGetValue(binding.SocketId, out var list) || list.Count == 0)
-            return null;
+        if (!_pairsBySocket.TryGetValue(binding.SocketId, out var list))
+        {
+            if (!allowPeerReflexive)
+                return null;
+
+            list = new List<CandidatePair>();
+            _pairsBySocket[binding.SocketId] = list;
+        }
 
         // 1. 精確匹配 CandidateId 與來源 EndPoint
-        var exact = list.FirstOrDefault(p =>
-            p.RemoteEndPoint.Equals(fromEp) &&
-            (string.Equals(p.LocalCandidateId, expectedLocalCandidateId, StringComparison.OrdinalIgnoreCase) ||
-             string.Equals(p.RemoteCandidateId, expectedRemoteCandidateId, StringComparison.OrdinalIgnoreCase)));
-        if (exact != null) return exact;
+        if (list.Count > 0)
+        {
+            var exact = list.FirstOrDefault(p =>
+                p.RemoteEndPoint.Equals(fromEp) &&
+                (string.Equals(p.LocalCandidateId, expectedLocalCandidateId, StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(p.RemoteCandidateId, expectedRemoteCandidateId, StringComparison.OrdinalIgnoreCase)));
+            if (exact != null) return exact;
 
-        // 2. 退而匹配同一 Socket + 來源 EndPoint
-        var byEp = list.FirstOrDefault(p => p.RemoteEndPoint.Equals(fromEp));
-        if (byEp != null) return byEp;
+            // 2. 退而匹配同一 Socket + 來源 EndPoint
+            var byEp = list.FirstOrDefault(p => p.RemoteEndPoint.Equals(fromEp));
+            if (byEp != null) return byEp;
+        }
 
-        // 3. Peer-Reflexive (prflx)：已通過 SessionId 與雙方 DeviceId 驗證，但對端經 NAT 轉換使用新映射端點 fromEp
-        if (!allowPeerReflexive || _dynamicPrflxCount >= 12)
+        // 3. Peer-Reflexive (prflx)：已通過 SessionId 與雙方 DeviceId 驗證，但對端經 NAT / Multi-WAN 轉換使用新映射端點 fromEp
+        if (!allowPeerReflexive || _dynamicPrflxCount >= 12 || !IsAcceptablePrflxSource(binding, fromEp))
             return null;
 
         string pairKey = $"{binding.SocketId}|{fromEp}";
         if (_registeredPairKeys.Contains(pairKey))
             return null;
 
+        bool fromIsLoopback = IPAddress.IsLoopback(fromEp.Address);
         var templatePair =
             list.FirstOrDefault(p =>
                 p.CheckState != CandidatePairCheckState.Invalidated &&
@@ -1580,48 +1650,68 @@ internal sealed class IceConnectivityChecker
                  string.Equals(p.RemoteCandidateId, expectedRemoteCandidateId, StringComparison.OrdinalIgnoreCase)))
             ?? list.FirstOrDefault(p =>
                 p.CheckState != CandidatePairCheckState.Invalidated &&
-                p.RemoteEndPoint.Address.Equals(fromEp.Address));
+                p.RemoteEndPoint.Address.Equals(fromEp.Address))
+            ?? list.FirstOrDefault(p =>
+                p.CheckState != CandidatePairCheckState.Invalidated &&
+                IPAddress.IsLoopback(p.RemoteEndPoint.Address) == fromIsLoopback &&
+                (string.Equals(p.LocalCandidateId, expectedLocalCandidateId, StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(p.RemoteCandidateId, expectedRemoteCandidateId, StringComparison.OrdinalIgnoreCase)))
+            ?? list.FirstOrDefault(p =>
+                p.CheckState != CandidatePairCheckState.Invalidated &&
+                IPAddress.IsLoopback(p.RemoteEndPoint.Address) == fromIsLoopback)
+            ?? list.FirstOrDefault(p =>
+                p.CheckState != CandidatePairCheckState.Invalidated);
 
-        if (templatePair == null)
+        var localCandidate = templatePair?.LocalCandidate
+            ?? binding.Candidates.FirstOrDefault(c => string.Equals(c.CandidateId, expectedLocalCandidateId, StringComparison.OrdinalIgnoreCase))
+            ?? binding.Candidates.FirstOrDefault(c => c.Type == IceCandidateType.Host)
+            ?? binding.Candidates.FirstOrDefault();
+
+        if (localCandidate == null)
             return null;
 
-        string prflxRemoteId = !string.IsNullOrWhiteSpace(expectedRemoteCandidateId)
-            ? $"{expectedRemoteCandidateId}#prflx-{fromEp.Port}"
-            : $"{templatePair.RemoteCandidateId}#prflx-{fromEp.Port}";
+        string prflxTag = $"{fromEp.Address}-{fromEp.Port}";
+        string baseRemoteId = !string.IsNullOrWhiteSpace(expectedRemoteCandidateId)
+            ? expectedRemoteCandidateId
+            : (templatePair?.RemoteCandidateId ?? "remote");
+        string prflxRemoteId = $"{baseRemoteId}#prflx-{prflxTag}";
+        string prflxPairId = $"{(templatePair?.PairId ?? $"{localCandidate.CandidateId}->{baseRemoteId}")}#prflx-{prflxTag}";
 
         var prflxRemoteCand = new IceCandidate
         {
             CandidateId = prflxRemoteId,
-            Type = templatePair.RemoteCandidate.Type == IceCandidateType.Host ? IceCandidateType.Srflx : templatePair.RemoteCandidate.Type,
-            AddressFamily = templatePair.RemoteCandidate.AddressFamily,
-            Protocol = templatePair.RemoteCandidate.Protocol,
+            Type = templatePair != null && templatePair.RemoteCandidate.Type != IceCandidateType.Host
+                ? templatePair.RemoteCandidate.Type
+                : IceCandidateType.Srflx,
+            AddressFamily = AddressFamily.InterNetwork,
+            Protocol = templatePair?.RemoteCandidate.Protocol ?? "UDP",
             Ip = fromEp.Address.ToString(),
             Port = fromEp.Port,
-            LocalAddress = templatePair.RemoteCandidate.LocalAddress,
-            LocalPort = templatePair.RemoteCandidate.LocalPort,
+            LocalAddress = templatePair?.RemoteCandidate.LocalAddress ?? fromEp.Address.ToString(),
+            LocalPort = templatePair?.RemoteCandidate.LocalPort ?? fromEp.Port,
             PublicAddress = fromEp.Address.ToString(),
             PublicPort = fromEp.Port,
-            Priority = templatePair.RemoteCandidate.Priority,
-            InterfaceId = templatePair.RemoteCandidate.InterfaceId,
-            SocketId = templatePair.RemoteCandidate.SocketId,
-            StunServer = templatePair.RemoteCandidate.StunServer,
+            Priority = templatePair?.RemoteCandidate.Priority ?? localCandidate.Priority,
+            InterfaceId = templatePair?.RemoteCandidate.InterfaceId ?? binding.Interface.InterfaceId,
+            SocketId = templatePair?.RemoteCandidate.SocketId ?? binding.SocketId,
+            StunServer = templatePair?.RemoteCandidate.StunServer ?? "",
             DiscoveryTimestamp = DateTime.UtcNow,
             ValidityStatus = CandidateValidityStatus.Valid,
-            Ufrag = templatePair.RemoteCandidate.Ufrag
+            Ufrag = templatePair?.RemoteCandidate.Ufrag ?? ""
         };
 
         var prflxPair = new CandidatePair
         {
-            PairId = $"{templatePair.PairId}#prflx-{fromEp.Port}",
-            InterfaceId = templatePair.InterfaceId,
-            SocketId = templatePair.SocketId,
-            LocalCandidateId = templatePair.LocalCandidateId,
+            PairId = prflxPairId,
+            InterfaceId = templatePair?.InterfaceId ?? binding.Interface.InterfaceId,
+            SocketId = templatePair?.SocketId ?? binding.SocketId,
+            LocalCandidateId = templatePair?.LocalCandidateId ?? localCandidate.CandidateId,
             RemoteCandidateId = prflxRemoteCand.CandidateId,
-            LocalCandidate = templatePair.LocalCandidate,
+            LocalCandidate = localCandidate,
             RemoteCandidate = prflxRemoteCand,
-            LocalEndPoint = templatePair.LocalEndPoint,
+            LocalEndPoint = templatePair?.LocalEndPoint ?? binding.LocalEndPoint,
             RemoteEndPoint = fromEp,
-            PairPriority = templatePair.PairPriority,
+            PairPriority = templatePair?.PairPriority ?? (ulong)Math.Max(1, localCandidate.Priority),
             IsPortPredictionFallback = false
         };
 
@@ -1635,6 +1725,24 @@ internal sealed class IceConnectivityChecker
 
         Log.Info($"[ICE/Pair] Attempt={_connectionAttemptId}, Session={_sessionId} 動態建立 Peer-Reflexive Pair: PairId={prflxPair.PairId}, Local={prflxPair.LocalEndPoint}, PrflxRemote={fromEp}");
         return prflxPair;
+    }
+
+    private static bool IsAcceptablePrflxSource(GatheredSocketBinding binding, IPEndPoint ep)
+    {
+        if (ep.Port <= 0 || ep.AddressFamily != AddressFamily.InterNetwork)
+            return false;
+        if (ep.Address.Equals(IPAddress.Any) || ep.Address.Equals(IPAddress.None) || ep.Address.Equals(IPAddress.Broadcast))
+            return false;
+
+        byte[] octets = ep.Address.GetAddressBytes();
+        if ((octets[0] & 0xF0) == 0xE0)
+            return false;
+
+        bool socketIsLoopback = binding.IsLoopbackFallback || IPAddress.IsLoopback(binding.LocalEndPoint.Address);
+        if (!socketIsLoopback && IPAddress.IsLoopback(ep.Address))
+            return false;
+
+        return true;
     }
 
     private void MarkPairExhausted(CandidatePair pair)

@@ -44,6 +44,12 @@ public class UiComponentTests
         using var form = new SettingsForm(hostConfig, viewerConfig, () => { });
         Assert.NotNull(form);
         Assert.Equal("RemoteDesk Settings", form.Text);
+
+        var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+        var panelsField = typeof(SettingsForm).GetField("_categoryPanels", flags);
+        var panels = Assert.IsType<Dictionary<string, Panel>>(panelsField!.GetValue(form));
+        Assert.True(panels.TryGetValue("About", out var aboutPanel));
+        Assert.Contains(aboutPanel.Controls.OfType<Label>(), l => l.Text.Contains($"v{RemoteDesk.Installer.InstallerEngine.AppVersion}", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -1563,7 +1569,7 @@ public class UiComponentTests
         string repoRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../.."));
         string ver = RemoteDesk.Installer.InstallerEngine.AppVersion;
 
-        Assert.Equal("2.0.1", ver);
+        Assert.Equal("2.0.2", ver);
         Assert.Matches(@"^\d+\.\d+\.\d+$", ver);
         Assert.Equal(ver, typeof(MainForm).Assembly.GetName().Version?.ToString(3));
         Assert.Equal(ver, typeof(RemoteDesk.Installer.InstallerEngine).Assembly.GetName().Version?.ToString(3));

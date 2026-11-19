@@ -180,6 +180,57 @@ internal sealed class ViewerSession : IDisposable
         }
     }
 
+    private async Task<(TcpClient Tcp, Stream Stream, SecureChannel Channel, ServerHello Hello)?> TryProbeLanEndpointAsync(
+        IPAddress ip,
+        int port,
+        string expectedHostId,
+        ProtocolCapabilities offeredCapabilities,
+        CancellationToken ct)
+    {
+        if (!IPAddress.IsLoopback(ip) && NetworkHelper.IsLocalAddress(ip))
+            return null;
+
+        var fastTcp = new TcpClient(AddressFamily.InterNetwork);
+        try
+        {
+            using (var quickCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            {
+                quickCts.CancelAfter(400);
+                using var reg = quickCts.Token.Register(() => { try { fastTcp.Dispose(); } catch { } });
+                await fastTcp.ConnectAsync(new IPEndPoint(ip, port), quickCts.Token).ConfigureAwait(false);
+            }
+
+            SecureChannel.TuneSocket(fastTcp.Client);
+            Stream probeStream = fastTcp.GetStream();
+
+            using var handshakeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            handshakeCts.CancelAfter(3000);
+            var (probeChannel, probeHello) = await SecureChannel.ClientHandshakeAsync(
+                probeStream, _identity.DeviceId, _identity.DeviceName, handshakeCts.Token, offeredCapabilities).ConfigureAwait(false);
+
+            if (!string.Equals(probeHello.HostId, expectedHostId, StringComparison.OrdinalIgnoreCase))
+            {
+                Log.Warn($"[內網探測略過] 內網 IP {ip}:{port} 回應裝置 ID ({probeHello.HostId}) 與目標 ({expectedHostId}) 不符，改嘗試其他端點或外網 P2P。");
+                try { probeChannel.Dispose(); } catch { }
+                try { probeStream.Dispose(); } catch { }
+                try { fastTcp.Dispose(); } catch { }
+                return null;
+            }
+
+            return (fastTcp, probeStream, probeChannel, probeHello);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            try { fastTcp.Dispose(); } catch { }
+            throw;
+        }
+        catch
+        {
+            try { fastTcp.Dispose(); } catch { }
+            return null;
+        }
+    }
+
     /// <summary>
     /// 連線至被控端電腦（自動解析 9 位數 Device ID 或 IP 地址）。
     /// </summary>
@@ -193,6 +244,9 @@ internal sealed class ViewerSession : IDisposable
         {
             IPEndPoint? endpoint = null;
             Stream? stream = null;
+            const ProtocolCapabilities offeredCapabilities = ProtocolCapabilities.FrameSeqAck;
+            SecureChannel? preverifiedChannel = null;
+            ServerHello? preverifiedHello = null;
             string cleanTarget = TargetIdOrHost.Replace(" ", "").Trim();
 
             if (!string.IsNullOrEmpty(_selfDeviceId) && NetworkHelper.IsSelfTarget(cleanTarget, _selfDeviceId, _config.ViewerId))
@@ -216,7 +270,9 @@ internal sealed class ViewerSession : IDisposable
                 }
                 catch { }
 
-                if (resolved != null && !resolved.Address.Equals(IPAddress.None))
+                if (resolved != null &&
+                    !resolved.Address.Equals(IPAddress.None) &&
+                    !NetworkHelper.IsLocalAddress(resolved.Address))
                 {
                     endpoint = resolved.EndPoint;
                     Log.Info($"[區網探索成功] 找到裝置 {cleanTarget} -> {endpoint} (採用內網高速直連)");
@@ -237,31 +293,27 @@ internal sealed class ViewerSession : IDisposable
 
                     if (dev != null && dev.IsOnline)
                     {
-                        // 2a. 若對方回報有內網 IP 且與本機處於同一子網段，先嘗試高速內網 TCP 直連
+                        // 2a. 若對方回報有內網 IP 且與本機處於同一子網段，先嘗試高速內網 TCP 探測並驗證目標 HostId 相符，避免誤連本機或撞名私網主機
                         if (dev.LocalIps != null && dev.LocalIps.Count > 0)
                         {
+                            int targetPort = dev.TcpPort > 0 ? dev.TcpPort : Protocol.DefaultTcpPort;
                             foreach (var lip in dev.LocalIps)
                             {
-                                if (IPAddress.TryParse(lip, out var parsedLip) && NetworkHelper.IsInSameSubnet(parsedLip))
+                                if (IPAddress.TryParse(lip, out var parsedLip) &&
+                                    (!NetworkHelper.IsLocalAddress(parsedLip) || IPAddress.IsLoopback(parsedLip)) &&
+                                    NetworkHelper.IsInSameSubnet(parsedLip))
                                 {
-                                    var fastTcp = new TcpClient(AddressFamily.InterNetwork);
-                                    using var quickCts = CancellationTokenSource.CreateLinkedTokenSource(token);
-                                    quickCts.CancelAfter(400);
-                                    using var reg = quickCts.Token.Register(() => { try { fastTcp.Dispose(); } catch { } });
-                                    try
+                                    var verified = await TryProbeLanEndpointAsync(
+                                        parsedLip, targetPort, cleanTarget, offeredCapabilities, token).ConfigureAwait(false);
+                                    if (verified != null)
                                     {
-                                        int targetPort = dev.TcpPort > 0 ? dev.TcpPort : Protocol.DefaultTcpPort;
-                                        await fastTcp.ConnectAsync(new IPEndPoint(parsedLip, targetPort), quickCts.Token).ConfigureAwait(false);
-                                        _tcp = fastTcp;
-                                        SecureChannel.TuneSocket(fastTcp.Client);
-                                        stream = fastTcp.GetStream();
+                                        _tcp = verified.Value.Tcp;
+                                        stream = verified.Value.Stream;
                                         _underlyingStream = stream;
-                                        Log.Info($"[內網直連成功] 透過目標回報之同網段內網 IP {parsedLip}:{targetPort} 建立 TCP 連線 (SelectedProtocol=LAN_TCP, Remote={parsedLip}:{targetPort})");
+                                        preverifiedChannel = verified.Value.Channel;
+                                        preverifiedHello = verified.Value.Hello;
+                                        Log.Info($"[內網直連成功] 透過目標回報之同網段內網 IP {parsedLip}:{targetPort} 建立 TCP 連線並驗證目標裝置 ID={cleanTarget} (SelectedProtocol=LAN_TCP, Remote={parsedLip}:{targetPort})");
                                         break;
-                                    }
-                                    catch
-                                    {
-                                        fastTcp.Dispose();
                                     }
                                 }
                             }
@@ -280,7 +332,7 @@ internal sealed class ViewerSession : IDisposable
 
                             Log.Info($"[P2P/ICE] 正在執行 STUN 候選端點收集、UDP Hole Punching 與失敗分類自動重試 (Session: {sessionId})...");
                             var retryOpts = UdpHolePuncher.BuildRetryOptionsFromTimeout(
-                                timeoutMs: 15000,
+                                timeoutMs: 22000,
                                 retainStandbyBindingsForMonitoring: true);
                             var punchResult = await UdpHolePuncher.PunchHoleWithRetryAsync(
                                 _signalingClient, sessionId, _signalingClient.Identity.DeviceId, cleanTarget,
@@ -361,9 +413,10 @@ internal sealed class ViewerSession : IDisposable
             }
 
             // 1. 金鑰協商（保留 activeSignalingSessionId 供 Phase 5 連線期間路徑異常時重新交換候選與判斷 SessionExpired）
-            const ProtocolCapabilities offeredCapabilities = ProtocolCapabilities.FrameSeqAck;
-            var (channel, hello) = await SecureChannel.ClientHandshakeAsync(
-                stream, _identity.DeviceId, _identity.DeviceName, token, offeredCapabilities).ConfigureAwait(false);
+            var (channel, hello) = preverifiedChannel != null && preverifiedHello != null
+                ? (preverifiedChannel, preverifiedHello)
+                : await SecureChannel.ClientHandshakeAsync(
+                    stream, _identity.DeviceId, _identity.DeviceName, token, offeredCapabilities).ConfigureAwait(false);
             _activeSignalingSessionId = activeSignalingSessionId;
             SupportsFrameSeqAck = (offeredCapabilities & hello.Capabilities & ProtocolCapabilities.FrameSeqAck) != 0;
             _channel = channel;

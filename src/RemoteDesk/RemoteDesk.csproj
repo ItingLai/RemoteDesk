@@ -12,7 +12,7 @@
     <ApplicationIcon>app.ico</ApplicationIcon>
     <AssemblyName>RemoteDesk</AssemblyName>
     <RootNamespace>RemoteDesk</RootNamespace>
-    <Version>2.0.1</Version>
+    <Version>2.0.2</Version>
     <Product>RemoteDesk</Product>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <NoWarn>$(NoWarn);CA1416;WFO1000</NoWarn>

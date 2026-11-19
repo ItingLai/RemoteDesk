@@ -375,12 +375,12 @@ internal static class UdpHolePuncher
             MaxRetryRounds = 3,
             StunTimeoutMs = stunTimeout,
             Round2StunTimeoutMs = Math.Max(stunTimeout, Math.Min(2400, effectiveTotal / 4)),
-            Round1ExchangeTimeoutMs = Math.Clamp((int)(effectiveTotal * 0.35), 900, 4500),
-            Round1CheckTimeoutMs = Math.Clamp((int)(effectiveTotal * 0.22), 700, 2600),
-            Round2ExchangeTimeoutMs = Math.Clamp((int)(effectiveTotal * 0.25), 800, 3200),
-            Round2CheckTimeoutMs = Math.Clamp((int)(effectiveTotal * 0.30), 900, 3600),
-            Round3ExchangeTimeoutMs = Math.Clamp((int)(effectiveTotal * 0.22), 700, 3000),
-            Round3CheckTimeoutMs = Math.Clamp((int)(effectiveTotal * 0.35), 1000, 4500),
+            Round1ExchangeTimeoutMs = Math.Clamp((int)(effectiveTotal * 0.35), 900, 5000),
+            Round1CheckTimeoutMs = Math.Clamp((int)(effectiveTotal * 0.22), 700, 3400),
+            Round2ExchangeTimeoutMs = Math.Clamp((int)(effectiveTotal * 0.25), 800, 3600),
+            Round2CheckTimeoutMs = Math.Clamp((int)(effectiveTotal * 0.30), 900, 4500),
+            Round3ExchangeTimeoutMs = Math.Clamp((int)(effectiveTotal * 0.22), 700, 3400),
+            Round3CheckTimeoutMs = Math.Clamp((int)(effectiveTotal * 0.35), 1000, 5500),
             GatheringOptions = gatheringOptions ?? new IceGatheringOptions
             {
                 StunTimeoutMs = stunTimeout,

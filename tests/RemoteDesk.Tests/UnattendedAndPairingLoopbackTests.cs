@@ -515,6 +515,79 @@ public class UnattendedAndPairingLoopbackTests : IDisposable
     }
 
     [Fact]
+    public async Task ConnectByDeviceId_WhenRemoteLocalIpCollidesWithSelfOrWrongHost_FallsBackToWanInsteadOfConnectingToSelf()
+    {
+        int wrongPort = FindFreeTcpPort();
+        var wrongDir = Path.Combine(_tempDir, "wrongHostSameIp");
+        var viewerDir = Path.Combine(_tempDir, "viewerSameIp");
+
+        // 本機自己（或同網段他機）於 wrongPort 監聽，模擬遠端 ID 與本機剛好擁有相同內網 IP 時誤連本機之衝突情境
+        using var wrongSelfId = DeviceIdentity.LoadOrCreate(wrongDir, "111222333", "SelfOrWrongHost");
+        using var viewerId = DeviceIdentity.LoadOrCreate(viewerDir, "111222333", "SelfViewer");
+        const string intendedRemoteId = "555666777";
+
+        var selfHostConfig = new HostConfig
+        {
+            DeviceId = wrongSelfId.DeviceId,
+            DeviceName = wrongSelfId.DeviceName,
+            TcpPort = wrongPort,
+            HostEnabled = true,
+            AllowInteractive = false,
+            UnattendedAccessEnabled = true
+        };
+        var trustStore = new TrustStore(Path.Combine(wrongDir, "trusted.json"));
+        using var hostDiscovery = new LanDiscovery(wrongSelfId.DeviceId, port: FindFreeTcpPort());
+        using var selfHostServer = new HostServer(selfHostConfig, hostDiscovery, new TrackingHostUi(), trustStore, wrongSelfId);
+        selfHostServer.Start();
+
+        var viewerConfig = new ViewerConfig { ViewerId = viewerId.DeviceId };
+        using var viewerDiscovery = new LanDiscovery(viewerId.DeviceId, port: FindFreeTcpPort());
+
+        string? ownLocalIp = LanDiscovery.LocalIPv4().Select(x => x.ip.ToString()).FirstOrDefault();
+        bool sessionCreateAttempted = false;
+        var localIpsJson = ownLocalIp != null ? $"[\"{ownLocalIp}\", \"127.0.0.1\"]" : "[\"127.0.0.1\"]";
+
+        var mockHttpHandler = new FuncHttpMessageHandler(req =>
+        {
+            if (req.RequestUri!.PathAndQuery.Contains($"/api/devices/{intendedRemoteId}"))
+            {
+                var json = $$"""
+                {
+                    "success": true,
+                    "deviceId": "{{intendedRemoteId}}",
+                    "deviceName": "RemoteTargetPC",
+                    "publicKey": "{{wrongSelfId.PublicKeyBase64}}",
+                    "publicIp": "203.0.113.10",
+                    "tcpPort": {{wrongPort}},
+                    "localIps": {{localIpsJson}},
+                    "onlineStatus": true
+                }
+                """;
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json")
+                };
+            }
+            if (req.RequestUri!.PathAndQuery.Contains("/api/sessions"))
+            {
+                sessionCreateAttempted = true;
+                return new HttpResponseMessage(HttpStatusCode.ServiceUnavailable);
+            }
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        });
+
+        using var mockHttp = new HttpClient(mockHttpHandler);
+        using var signalingClient = new SignalingClient("https://mock-signaling.local", viewerId, mockHttp);
+        using var viewerSession = new ViewerSession(intendedRemoteId, viewerConfig, viewerDiscovery, wrongSelfId.DeviceId, viewerId, signalingClient);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(6));
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => viewerSession.ConnectAsync(null, cts.Token));
+
+        Assert.DoesNotContain("禁止連線到本機自己的 IP 或 ID", ex.Message);
+        Assert.True(sessionCreateAttempted, "應略過撞名之內網 IP 並改走外網 Signaling / P2P 流程");
+    }
+
+    [Fact]
     public async Task DualParallelAuth_HostAcceptsFirst_ConnectsSuccessfully()
     {
         int port = FindFreeTcpPort();

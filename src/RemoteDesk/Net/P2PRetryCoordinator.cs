@@ -649,40 +649,76 @@ internal static class P2PRetryCoordinator
         string detail = "";
         string reasonTag = retryReason == P2PFailureReason.None ? "" : retryReason.ToString();
 
-        foreach (var cand in localCandidates)
+        object outcomeLock = new();
+        SignalingExchangeOutcome? expiredOutcome = null;
+
+        if (localCandidates.Count > 0)
         {
-            var sig = new IceSignal
-            {
-                Type = "candidate",
-                Candidate = cand,
-                SessionId = sessionId,
-                SenderDeviceId = selfDeviceId,
-                ReceiverDeviceId = remoteDeviceId,
-                RetryRound = round,
-                RetryReason = reasonTag
-            };
-            string json = sig.ToJson();
-            string deterministicMsgId = $"{attemptId}-r{round}-c-{cand.CandidateId}";
+            using var concurrencyGate = new SemaphoreSlim(6, 6);
+            using var publishCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
-            var postRes = await signaling.PostSignalAsync(sessionId, remoteDeviceId, json, "candidate", ct, deterministicMsgId).ConfigureAwait(false);
-            if (!postRes.Succeeded && postRes.Status == SignalingCallStatus.TimedOutOrTransportError && !ct.IsCancellationRequested)
+            var tasks = localCandidates.Select(async cand =>
             {
-                transportErrors++;
-                await Task.Delay(80, ct).ConfigureAwait(false);
-                postRes = await signaling.PostSignalAsync(sessionId, remoteDeviceId, json, "candidate", ct, deterministicMsgId).ConfigureAwait(false);
-            }
+                await concurrencyGate.WaitAsync(publishCts.Token).ConfigureAwait(false);
+                try
+                {
+                    if (publishCts.IsCancellationRequested)
+                        return;
 
-            if (postRes.Status == SignalingCallStatus.SessionExpired)
-            {
-                return new SignalingExchangeOutcome(false, SignalingCallStatus.SessionExpired, transportErrors, 0, false, postRes.ErrorDetail);
-            }
+                    var sig = new IceSignal
+                    {
+                        Type = "candidate",
+                        Candidate = cand,
+                        SessionId = sessionId,
+                        SenderDeviceId = selfDeviceId,
+                        ReceiverDeviceId = remoteDeviceId,
+                        RetryRound = round,
+                        RetryReason = reasonTag
+                    };
+                    string json = sig.ToJson();
+                    string deterministicMsgId = $"{attemptId}-r{round}-c-{cand.CandidateId}";
 
-            if (!postRes.Succeeded)
-            {
-                transportErrors++;
-                if (worstStatus == SignalingCallStatus.Ok) worstStatus = postRes.Status;
-                detail = postRes.ErrorDetail;
-            }
+                    var postRes = await signaling.PostSignalAsync(sessionId, remoteDeviceId, json, "candidate", publishCts.Token, deterministicMsgId).ConfigureAwait(false);
+                    if (!postRes.Succeeded && postRes.Status == SignalingCallStatus.TimedOutOrTransportError && !publishCts.IsCancellationRequested)
+                    {
+                        Interlocked.Increment(ref transportErrors);
+                        await Task.Delay(80, publishCts.Token).ConfigureAwait(false);
+                        postRes = await signaling.PostSignalAsync(sessionId, remoteDeviceId, json, "candidate", publishCts.Token, deterministicMsgId).ConfigureAwait(false);
+                    }
+
+                    if (postRes.Status == SignalingCallStatus.SessionExpired)
+                    {
+                        lock (outcomeLock)
+                        {
+                            expiredOutcome ??= new SignalingExchangeOutcome(false, SignalingCallStatus.SessionExpired, Volatile.Read(ref transportErrors), 0, false, postRes.ErrorDetail);
+                        }
+                        publishCts.Cancel();
+                        return;
+                    }
+
+                    if (!postRes.Succeeded)
+                    {
+                        Interlocked.Increment(ref transportErrors);
+                        lock (outcomeLock)
+                        {
+                            if (worstStatus == SignalingCallStatus.Ok) worstStatus = postRes.Status;
+                            detail = postRes.ErrorDetail;
+                        }
+                    }
+                }
+                catch (OperationCanceledException) when (publishCts.IsCancellationRequested && !ct.IsCancellationRequested)
+                {
+                    // Another candidate detected SessionExpired and cancelled sibling uploads.
+                }
+                finally
+                {
+                    concurrencyGate.Release();
+                }
+            }).ToArray();
+
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+            if (expiredOutcome != null)
+                return expiredOutcome;
         }
 
         var doneSig = new IceSignal
@@ -737,9 +773,9 @@ internal static class P2PRetryCoordinator
         string lastDetail = publishOutcome.Detail;
         int pollStep = Math.Clamp(pollIntervalMs, 20, 200);
 
-        // 若進入第 2/3 輪且先前已取得對端較舊輪次候選，僅先以短同步視窗等待對端本輪新候選，避免阻塞非同步切換恢復
+        // 若進入第 2/3 輪且先前已取得對端較舊輪次候選，保留合理同步視窗等待對端本輪新候選，避免太早以舊埠空耗本輪時間
         bool hasPriorRemotes = allowEarlyPriorFallback && round > 1 && inbox.RemoteCandidates.Count > 0;
-        int syncGraceWhenPriorExistsMs = Math.Min(exchangeTimeoutMs, 420);
+        int syncGraceWhenPriorExistsMs = Math.Min(exchangeTimeoutMs, Math.Max(420, (int)(exchangeTimeoutMs * 0.55)));
 
         while (sw.ElapsedMilliseconds < exchangeTimeoutMs && !ct.IsCancellationRequested)
         {
